@@ -1,0 +1,63 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #090b0f;
+  --surface: #131722;
+  --surface-2: #1a2030;
+  --text: #f2f5fb;
+  --muted: #9aa6bf;
+  --line: #2b3347;
+  --accent: #3ce0b7;
+  --accent-2: #ff6b4a;
+  --good: #34d399;
+  --bad: #f87171;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: "IBM Plex Sans", sans-serif;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(60, 224, 183, 0.14), transparent 35%),
+    radial-gradient(circle at 88% 5%, rgba(255, 107, 74, 0.16), transparent 28%),
+    linear-gradient(180deg, #07090d 0%, #0a0d14 100%);
+  color: var(--text);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: "Space Grotesk", sans-serif;
+  letter-spacing: 0.01em;
+}
+
+.grid-ambient {
+  background-image: linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Data and model artifacts
+artifacts/
+catboost_info/
+backend/catboost_info/
+data/metadata/
+data/raw/
+data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+*.pkl
+*.parquet
+*.log
+
+# Node / Next.js
+node_modules/
+.next/
+frontend/.next/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# VS Code / workspace state
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

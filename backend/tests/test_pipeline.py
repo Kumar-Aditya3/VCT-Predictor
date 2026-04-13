@@ -1,0 +1,179 @@
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from app.core.config import get_settings
+from app.models.schemas import MatchFixture, MatchPrediction
+from app.models.vlr import VLRMatchDetails, VLRMatchRecord
+from app.services.modeling import load_model_bundle, predict_match_probability, train_prediction_bundle
+from app.services import pipeline as pipeline_service
+from app.services.pipeline import get_model_performance, get_validation_report, predict_fixtures, run_weekly_update
+from app.services.storage import SQLiteStore
+from app.services.vlr_client import extract_tier1_metadata
+from app.services.vlr_validation import compute_winner_accuracy
+from tests.synthetic_data import generate_synthetic_vct_dataset
+
+
+def build_training_records(count: int = 30) -> list[VLRMatchRecord]:
+    return generate_synthetic_vct_dataset(match_count=count).records
+
+
+def build_training_details(records: list[VLRMatchRecord]) -> list[VLRMatchDetails]:
+    return generate_synthetic_vct_dataset(match_count=len(records)).details
+
+
+class PipelineServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        os.environ["ARTIFACTS_DIR"] = self.temp_dir.name
+        os.environ["MODEL_ARTIFACTS_DIR"] = str(Path(self.temp_dir.name) / "models")
+        os.environ["SQLITE_DB_PATH"] = str(Path(self.temp_dir.name) / "vct.sqlite3")
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+        for key in ("ARTIFACTS_DIR", "MODEL_ARTIFACTS_DIR", "SQLITE_DB_PATH"):
+            os.environ.pop(key, None)
+        get_settings.cache_clear()
+
+    def test_train_prediction_bundle_builds_bundle(self) -> None:
+        records = build_training_records()
+        details = build_training_details(records)
+        maps = [item for detail in details for item in detail.maps]
+        player_stats = [item for detail in details for item in detail.player_stats]
+        bundle = train_prediction_bundle(records, maps, player_stats)
+        self.assertIsNotNone(bundle)
+        assert bundle is not None
+        self.assertTrue(bundle["model_version"].startswith("vlr-core-"))
+        self.assertGreater(bundle["metrics"]["map_training_samples"], 0)
+
+    def test_predict_fixtures_uses_trained_model_when_available(self) -> None:
+        records = build_training_records()
+        details = build_training_details(records)
+        bundle = train_prediction_bundle(records, [item for detail in details for item in detail.maps], [item for detail in details for item in detail.player_stats])
+        assert bundle is not None
+        with patch("app.services.pipeline.load_model_bundle", return_value=bundle):
+            fixtures = [
+                MatchFixture(match_id="sample-1", region="Pacific", event_name="Masters", event_stage="Group Stage", team_a="Alpha 1", team_b="Beta 1", match_date="2026-04-08", best_of=3)
+            ]
+            prediction = predict_fixtures(fixtures).predictions[0]
+        self.assertTrue(prediction.model_version.startswith("vlr-core-"))
+        self.assertGreater(len(prediction.player_projections), 0)
+        self.assertIsNotNone(prediction.confidence_score)
+        self.assertIsNotNone(prediction.prediction_generated_at)
+        self.assertGreater(prediction.sample_size or 0, 0)
+
+    def test_predict_match_probability_is_order_invariant(self) -> None:
+        records = build_training_records()
+        details = build_training_details(records)
+        bundle = train_prediction_bundle(
+            records,
+            [item for detail in details for item in detail.maps],
+            [item for detail in details for item in detail.player_stats],
+        )
+        assert bundle is not None
+        fixture = MatchFixture(
+            match_id="sample-1",
+            region="Pacific",
+            event_name="Masters",
+            event_stage="Group Stage",
+            team_a="Alpha 1",
+            team_b="Beta 1",
+            match_date="2026-04-08",
+            best_of=3,
+        )
+        reverse_fixture = MatchFixture(
+            match_id="sample-1",
+            region="Pacific",
+            event_name="Masters",
+            event_stage="Group Stage",
+            team_a="Beta 1",
+            team_b="Alpha 1",
+            match_date="2026-04-08",
+            best_of=3,
+        )
+        probability = predict_match_probability(fixture, bundle)
+        reverse_probability = predict_match_probability(reverse_fixture, bundle)
+        self.assertAlmostEqual(probability, 1.0 - reverse_probability, places=6)
+
+    def test_compute_winner_accuracy_handles_matches_and_misses(self) -> None:
+        predictions = [
+            MatchPrediction(match_id="match-1", team_a="Team Alpha", team_b="Team Beta", team_a_match_win_probability=0.6, map_predictions=[], player_projections=[], model_version="vlr-core-test"),
+            MatchPrediction(match_id="missing", team_a="Team One", team_b="Team Two", team_a_match_win_probability=0.4, map_predictions=[], player_projections=[], model_version="vlr-core-test"),
+        ]
+        truth = [VLRMatchRecord(match_id="match-1", event_name="Masters", region="Pacific", match_date="2026-04-08", team_a="Team Alpha", team_b="Team Beta", team_a_maps_won=2, team_b_maps_won=1, best_of=3)]
+        metrics = compute_winner_accuracy(predictions, truth)
+        self.assertEqual(metrics.compared_matches, 1)
+        self.assertEqual(metrics.winner_accuracy, 1.0)
+
+    @patch("app.services.pipeline.VLRClient.fetch_match_details")
+    @patch("app.services.pipeline.VLRClient.fetch_upcoming_fixtures")
+    @patch("app.services.pipeline.VLRClient.fetch_matches")
+    def test_weekly_update_persists_trained_model(self, mock_fetch_matches, mock_fetch_upcoming, mock_fetch_details) -> None:
+        records = build_training_records()
+        mock_fetch_matches.return_value = records
+        mock_fetch_upcoming.return_value = []
+        mock_fetch_details.return_value = build_training_details(records)
+        summary = run_weekly_update()
+        model_bundle = load_model_bundle()
+        store = SQLiteStore()
+        self.assertEqual(summary.status, "ok")
+        self.assertIsNotNone(model_bundle)
+        self.assertGreater(store.counts()["player_stats"], 0)
+        self.assertGreater(get_model_performance().map_training_samples, 0)
+        self.assertIn(get_validation_report().status, {"pass", "warn"})
+
+    def test_extract_tier1_metadata_parses_vct_event_names(self) -> None:
+        self.assertEqual(extract_tier1_metadata("Group Stage VCT 2026: Pacific Stage 1"), ("Split 1", "Pacific"))
+        self.assertEqual(extract_tier1_metadata("Playoffs VCT 2026: China Stage 2"), ("Split 2", "China"))
+        self.assertEqual(extract_tier1_metadata("VCT 2026 Masters - Grand Final"), ("Masters", "International"))
+        self.assertEqual(extract_tier1_metadata("VCT 2026 Champions - Lower Final"), ("Champions", "International"))
+        self.assertEqual(extract_tier1_metadata("VCT 2026 Kickoff - Showmatch"), (None, None))
+
+    def test_synthetic_generator_produces_tier1_compatible_dataset(self) -> None:
+        dataset = generate_synthetic_vct_dataset(match_count=12, seed=7)
+        self.assertEqual(len(dataset.records), 12)
+        self.assertEqual(len(dataset.details), 12)
+        self.assertGreater(len(dataset.maps), 12)
+        self.assertGreater(len(dataset.player_stats), 0)
+        self.assertTrue(all(record.event_name in {"Kickoff", "Split 1", "Split 2", "Masters", "Champions"} for record in dataset.records))
+        self.assertTrue(all(record.region in {"Americas", "EMEA", "Pacific", "China", "International"} for record in dataset.records))
+
+    def test_publish_guardrails_require_thresholds(self) -> None:
+        current_bundle = {
+            "metrics": {
+                "winner_accuracy": 0.7,
+                "rolling_winner_accuracy": 0.66,
+                "map_accuracy": 0.56,
+                "player_kd_mae": 3.1,
+            }
+        }
+        passing_candidate = {
+            "metrics": {
+                "winner_accuracy": 0.71,
+                "rolling_winner_accuracy": 0.66,
+                "map_accuracy": 0.56,
+                "player_kd_mae": 3.0,
+            }
+        }
+        failing_candidate = {
+            "metrics": {
+                "winner_accuracy": 0.66,
+                "rolling_winner_accuracy": 0.66,
+                "map_accuracy": 0.56,
+                "player_kd_mae": 3.0,
+            }
+        }
+        self.assertTrue(pipeline_service._should_publish_bundle(passing_candidate, current_bundle))
+        self.assertFalse(pipeline_service._should_publish_bundle(failing_candidate, current_bundle))
+
+
+if __name__ == "__main__":
+    unittest.main()

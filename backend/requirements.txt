@@ -1,0 +1,16 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+pandas==2.3.1
+numpy==2.3.2
+scikit-learn==1.7.1
+xgboost==3.0.4
+lightgbm==4.6.0
+catboost==1.2.8
+httpx==0.28.1
+python-dateutil==2.9.0.post0
+apscheduler==3.10.4
+orjson==3.10.18
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
