@@ -59,6 +59,9 @@ ELO_K = 24.0
 COMMON_MAPS = ("Abyss", "Ascent", "Bind", "Haven", "Icebox", "Lotus", "Pearl", "Split", "Sunset")
 SHORT_WINDOW = 3
 MEDIUM_WINDOW = 5
+MATCH_DECAY_GRID = (0.02, 0.04)
+MAP_DECAY_GRID = (0.01, 0.02)
+PLAYER_DECAY_GRID = (0.01, 0.02)
 
 
 @dataclass
@@ -118,7 +121,8 @@ def train_prediction_bundle(
         feature_store["match_labels"],
         feature_store["match_dates"],
         f"vlr-match-{ordered_matches[-1].match_date.isoformat()}",
-        objective="holdout",
+        objective="rolling",
+        decay_values=MATCH_DECAY_GRID,
     )
     map_bundle = _train_classifier_bundle(
         feature_store["map_rows"],
@@ -126,6 +130,7 @@ def train_prediction_bundle(
         feature_store["map_dates"],
         f"vlr-map-{ordered_matches[-1].match_date.isoformat()}",
         objective="rolling",
+        decay_values=MAP_DECAY_GRID,
     )
     player_kills_bundle = None
     player_deaths_bundle = None
@@ -135,12 +140,14 @@ def train_prediction_bundle(
             feature_store["player_kills"],
             feature_store["player_dates"],
             f"vlr-player-kills-{ordered_matches[-1].match_date.isoformat()}",
+            decay_values=PLAYER_DECAY_GRID,
         )
         player_deaths_bundle = _train_regressor_bundle(
             feature_store["player_rows"],
             feature_store["player_deaths"],
             feature_store["player_dates"],
             f"vlr-player-deaths-{ordered_matches[-1].match_date.isoformat()}",
+            decay_values=PLAYER_DECAY_GRID,
         )
     if match_bundle is None or map_bundle is None:
         return None
@@ -242,7 +249,28 @@ def predict_match_probability(fixture: MatchFixture, model_bundle: dict) -> floa
     reverse_probability = _predict_classifier_probability(model_bundle["match_model"], reverse_frame)
 
     # Make inference invariant to Team A / Team B ordering.
-    return float(np.clip((forward_probability + (1.0 - reverse_probability)) / 2.0, 1e-6, 1 - 1e-6))
+    invariant_probability = (forward_probability + (1.0 - reverse_probability)) / 2.0
+    prior_delta = _context_matchup_prior(fixture, model_bundle["context"])
+    blended_probability = invariant_probability + (0.2 * prior_delta)
+    return float(np.clip(blended_probability, 1e-6, 1 - 1e-6))
+
+
+def _context_matchup_prior(fixture: MatchFixture, context: dict) -> float:
+    team_states = context["team_states"]
+    player_states = context["player_states"]
+    head_to_head = context["head_to_head"]
+    team_a_state = team_states.get(fixture.team_a, TeamState())
+    team_b_state = team_states.get(fixture.team_b, TeamState())
+
+    # Bounded prior signal used to guide close calls with robust context.
+    signal = (
+        0.45 * (_win_rate(team_a_state) - _win_rate(team_b_state))
+        + 0.35 * (_matchup_delta(fixture.team_a, fixture.team_b, head_to_head) / 3.0)
+        + 0.2 * ((_team_player_metric(fixture.team_a, player_states, "kills") - _team_player_metric(fixture.team_b, player_states, "kills")) / 5.0)
+        - 0.2 * ((_team_player_metric(fixture.team_a, player_states, "deaths") - _team_player_metric(fixture.team_b, player_states, "deaths")) / 5.0)
+        + 0.15 * (_lineup_stability(fixture.team_a, context) - _lineup_stability(fixture.team_b, context))
+    )
+    return float(np.clip(signal, -0.2, 0.2))
 
 
 def predict_map_probability(fixture: MatchFixture, map_name: str, picked_by: str | None, model_bundle: dict) -> float:
@@ -577,6 +605,7 @@ def _train_classifier_bundle(
     version: str,
     *,
     objective: str = "rolling",
+    decay_values: tuple[float, ...] = (0.005, 0.01, 0.02),
 ) -> dict | None:
     if len(rows) < 20:
         return None
@@ -595,7 +624,7 @@ def _train_classifier_bundle(
     candidates = _classifier_candidates()
     candidate_results: list[dict] = []
     for candidate in candidates:
-        for decay_lambda in (0.005, 0.01, 0.02):
+        for decay_lambda in decay_values:
             rolling_accuracy = _rolling_classifier_score(
                 frame,
                 labels,
@@ -721,7 +750,14 @@ def _train_classifier_bundle(
     }
 
 
-def _train_regressor_bundle(rows: list[dict], targets: list[float], dates: list[date], version: str) -> dict | None:
+def _train_regressor_bundle(
+    rows: list[dict],
+    targets: list[float],
+    dates: list[date],
+    version: str,
+    *,
+    decay_values: tuple[float, ...] = (0.005, 0.01, 0.02),
+) -> dict | None:
     if len(rows) < 40:
         return None
     frame = pd.DataFrame(rows)
@@ -739,7 +775,7 @@ def _train_regressor_bundle(rows: list[dict], targets: list[float], dates: list[
     candidates = _regressor_candidates()
     candidate_results: list[dict] = []
     for candidate in candidates:
-        for decay_lambda in (0.005, 0.01, 0.02):
+        for decay_lambda in decay_values:
             rolling_mae = _rolling_regressor_score(
                 frame,
                 targets,
