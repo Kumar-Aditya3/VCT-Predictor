@@ -200,8 +200,8 @@ def _parse_match_detail_page(record: VLRMatchRecord, html: str) -> VLRMatchDetai
         if not game_id:
             continue
         header = game_node.select_one("div.vm-stats-game-header")
-        table = game_node.select_one("table.wf-table-inset.mod-overview")
-        if header is None or table is None:
+        tables = game_node.select("table.wf-table-inset.mod-overview")
+        if header is None or not tables:
             continue
 
         map_record = _parse_map_header(record, header, game_id, order_index)
@@ -209,10 +209,11 @@ def _parse_match_detail_page(record: VLRMatchRecord, html: str) -> VLRMatchDetai
             continue
         maps.append(map_record)
 
-        for row in table.select("tbody tr"):
-            parsed_row = _parse_player_row(record, map_record, row)
-            if parsed_row is not None:
-                player_stats.append(parsed_row)
+        for table in tables:
+            for row in table.select("tbody tr"):
+                parsed_row = _parse_player_row(record, map_record, row)
+                if parsed_row is not None:
+                    player_stats.append(parsed_row)
 
     if not maps:
         return None
