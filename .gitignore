@@ -43,6 +43,7 @@ yarn-error.log*
 
 # VS Code / workspace state
 .vscode/
+.pipeline_initialized
 
 # OS
 .DS_Store

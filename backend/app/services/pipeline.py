@@ -214,9 +214,8 @@ def run_weekly_update() -> WeeklyRunSummary:
     model_bundle = train_prediction_bundle(matches, maps, player_stats)
     publish_note = "trained_new_bundle"
     if previous_bundle is not None and model_bundle is not None and not _should_publish_bundle(model_bundle, previous_bundle):
-        model_bundle = previous_bundle
-        publish_note = "kept_previous_bundle_due_to_match_regression"
-    model_path = save_model_bundle(model_bundle) if model_bundle is not None and publish_note != "kept_previous_bundle_due_to_match_regression" else None
+        publish_note = "trained_new_bundle_below_guardrail"
+    model_path = save_model_bundle(model_bundle) if model_bundle is not None else None
 
     try:
         upcoming_fixtures = filter_tier1_fixtures(client.fetch_upcoming_fixtures(from_date=now.date(), to_date=now.date() + timedelta(days=7)))

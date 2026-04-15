@@ -147,10 +147,11 @@ def train_prediction_bundle(
 
     player_mae = ((player_kills_bundle["mae"] + player_deaths_bundle["mae"]) / 2) if (player_kills_bundle and player_deaths_bundle) else 0.0
     player_cv_score = max(0.0, 1.0 - player_mae / 25.0) if (player_kills_bundle and player_deaths_bundle) else 0.0
-    model_version = f"vlr-core-{ordered_matches[-1].match_date.isoformat()}"
+    trained_at = pd.Timestamp.utcnow().isoformat()
+    model_version = f"vlr-core-{pd.Timestamp.utcnow().strftime('%Y%m%d-%H%M%S')}"
     return {
         "model_version": model_version,
-        "trained_at": pd.Timestamp.utcnow().isoformat(),
+        "trained_at": trained_at,
         "history_start": ordered_matches[0].match_date.isoformat(),
         "history_end": ordered_matches[-1].match_date.isoformat(),
         "match_model": match_bundle,

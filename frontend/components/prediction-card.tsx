@@ -13,6 +13,8 @@ type PredictionCardProps = {
 
 export function PredictionCard({ prediction, index }: PredictionCardProps) {
   const teamBProbability = 1 - prediction.team_a_match_win_probability;
+  const teamATone = prediction.team_a_match_win_probability > teamBProbability ? "good" : "neutral";
+  const teamBTone = teamBProbability > prediction.team_a_match_win_probability ? "good" : "neutral";
   const contextLabel = [prediction.region, prediction.event_name, prediction.event_stage].filter(Boolean).join(" | ");
   const confidenceLabel =
     prediction.confidence_score == null ? null : `${Math.round(prediction.confidence_score * 100)}% confidence`;
@@ -45,12 +47,12 @@ export function PredictionCard({ prediction, index }: PredictionCardProps) {
           <StatPill
             label={prediction.team_a}
             value={`${Math.round(prediction.team_a_match_win_probability * 100)}%`}
-            tone="good"
+            tone={teamATone}
           />
           <StatPill
             label={prediction.team_b}
             value={`${Math.round(teamBProbability * 100)}%`}
-            tone="neutral"
+            tone={teamBTone}
           />
         </div>
       </div>
