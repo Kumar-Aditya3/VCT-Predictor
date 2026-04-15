@@ -122,6 +122,7 @@ def _build_match_prediction(fixture: MatchFixture, model_bundle: dict | None) ->
             PlayerProjection(
                 player_name=row["player_name"],
                 team_name=row["team_name"],
+                map_name=row.get("map_name"),
                 agent_name=row["agent_name"],
                 projected_kills=row["projected_kills"],
                 projected_deaths=row["projected_deaths"],

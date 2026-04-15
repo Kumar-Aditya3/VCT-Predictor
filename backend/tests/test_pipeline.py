@@ -70,6 +70,23 @@ class PipelineServiceTests(unittest.TestCase):
         self.assertIsNotNone(prediction.prediction_generated_at)
         self.assertGreater(prediction.sample_size or 0, 0)
 
+    def test_predict_fixtures_generates_player_rows_without_player_models(self) -> None:
+        records = build_training_records()
+        details = build_training_details(records)
+        bundle = train_prediction_bundle(records, [item for detail in details for item in detail.maps], [item for detail in details for item in detail.player_stats])
+        assert bundle is not None
+        bundle["player_kills_model"] = None
+        bundle["player_deaths_model"] = None
+
+        with patch("app.services.pipeline.load_model_bundle", return_value=bundle):
+            fixtures = [
+                MatchFixture(match_id="sample-2", region="Pacific", event_name="Masters", event_stage="Group Stage", team_a="Alpha 1", team_b="Beta 1", match_date="2026-04-08", best_of=3)
+            ]
+            prediction = predict_fixtures(fixtures).predictions[0]
+
+        self.assertGreater(len(prediction.player_projections), 0)
+        self.assertTrue(all(player.map_name is not None for player in prediction.player_projections))
+
     def test_predict_match_probability_is_order_invariant(self) -> None:
         records = build_training_records()
         details = build_training_details(records)

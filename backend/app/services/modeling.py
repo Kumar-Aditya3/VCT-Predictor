@@ -264,12 +264,9 @@ def predict_player_stat_lines(
     selected_maps: list[tuple[str, str | None]],
     model_bundle: dict,
 ) -> list[dict]:
-    if model_bundle.get("player_kills_model") is None or model_bundle.get("player_deaths_model") is None:
-        return []
+    has_player_models = model_bundle.get("player_kills_model") is not None and model_bundle.get("player_deaths_model") is not None
     context = model_bundle["context"]
     match_probability = predict_match_probability(fixture, model_bundle)
-    decider_weight = max(0.15, 1.0 - abs(match_probability - 0.5) * 2)
-    map_weights = [1.0, 1.0, decider_weight][: len(selected_maps)]
     team_a_players = _likely_lineup(fixture.team_a, context)
     team_b_players = _likely_lineup(fixture.team_b, context)
     projections: list[dict] = []
@@ -279,26 +276,63 @@ def predict_player_stat_lines(
         (fixture.team_b, fixture.team_a, team_b_players),
     ):
         for player_name in players:
-            total_kills = 0.0
-            total_deaths = 0.0
             agent_name = _preferred_agent(player_name, context)
-            for (map_name, _picked_by), weight in zip(selected_maps, map_weights):
-                row = build_player_feature_row(fixture, team_name, opponent_team, player_name, map_name, agent_name, context)
-                frame = pd.DataFrame([row], columns=model_bundle["player_kills_model"]["feature_columns"])
-                kills = float(model_bundle["player_kills_model"]["pipeline"].predict(frame)[0])
-                deaths = float(model_bundle["player_deaths_model"]["pipeline"].predict(frame)[0])
-                total_kills += max(0.0, kills) * weight
-                total_deaths += max(0.0, deaths) * weight
-            projections.append(
-                {
-                    "player_name": player_name,
-                    "team_name": team_name,
-                    "agent_name": agent_name,
-                    "projected_kills": round(total_kills, 1),
-                    "projected_deaths": round(total_deaths, 1),
-                }
-            )
+            team_win_bias = match_probability if team_name == fixture.team_a else (1.0 - match_probability)
+            for map_name, picked_by in selected_maps:
+                if has_player_models:
+                    row = build_player_feature_row(fixture, team_name, opponent_team, player_name, map_name, agent_name, context)
+                    frame = pd.DataFrame([row], columns=model_bundle["player_kills_model"]["feature_columns"])
+                    kills = float(model_bundle["player_kills_model"]["pipeline"].predict(frame)[0])
+                    deaths = float(model_bundle["player_deaths_model"]["pipeline"].predict(frame)[0])
+                else:
+                    kills, deaths = _baseline_player_stat_projection(
+                        team_name,
+                        opponent_team,
+                        player_name,
+                        map_name,
+                        picked_by,
+                        agent_name,
+                        context,
+                        team_win_bias,
+                    )
+                projections.append(
+                    {
+                        "player_name": player_name,
+                        "team_name": team_name,
+                        "map_name": map_name,
+                        "agent_name": agent_name,
+                        "projected_kills": round(max(0.0, kills), 1),
+                        "projected_deaths": round(max(0.0, deaths), 1),
+                    }
+                )
     return projections
+
+
+def _baseline_player_stat_projection(
+    team_name: str,
+    opponent_team: str,
+    player_name: str,
+    map_name: str,
+    picked_by: str | None,
+    agent_name: str | None,
+    context: dict,
+    team_win_bias: float,
+) -> tuple[float, float]:
+    player_state = context["player_states"].get(player_name)
+    base_kills = _player_metric(player_state, "kills", map_name=map_name, agent_name=agent_name)
+    base_deaths = _player_metric(player_state, "deaths", map_name=map_name, agent_name=agent_name)
+
+    map_edge = _team_map_win_rate(team_name, map_name, context) - _team_map_win_rate(opponent_team, map_name, context)
+    picked_bonus = 0.03 if picked_by == team_name else -0.03 if picked_by == opponent_team else 0.0
+    win_bias = team_win_bias - 0.5
+    stability_edge = _lineup_stability(team_name, context) - _lineup_stability(opponent_team, context)
+
+    kills_factor = 1.0 + (0.16 * win_bias) + (0.12 * map_edge) + picked_bonus + (0.05 * stability_edge)
+    deaths_factor = 1.0 - (0.11 * win_bias) - (0.08 * map_edge) - (picked_bonus * 0.7)
+
+    kills = base_kills * max(0.75, min(1.35, kills_factor))
+    deaths = base_deaths * max(0.7, min(1.3, deaths_factor))
+    return kills, deaths
 
 
 def select_maps_for_fixture(fixture: MatchFixture, model_bundle: dict) -> list[tuple[str, str | None]]:
