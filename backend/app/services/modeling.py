@@ -59,9 +59,9 @@ ELO_K = 24.0
 COMMON_MAPS = ("Abyss", "Ascent", "Bind", "Haven", "Icebox", "Lotus", "Pearl", "Split", "Sunset")
 SHORT_WINDOW = 3
 MEDIUM_WINDOW = 5
-MATCH_DECAY_GRID = (0.02, 0.04)
-MAP_DECAY_GRID = (0.01, 0.02)
-PLAYER_DECAY_GRID = (0.01, 0.02)
+MATCH_DECAY_GRID = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04)
+MAP_DECAY_GRID = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04)
+PLAYER_DECAY_GRID = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04)
 WIN_PRIOR_ALPHA = 2.0
 WIN_PRIOR_BETA = 2.0
 MAP_PRIOR_ALPHA = 1.5
@@ -877,6 +877,16 @@ def _regressor_pipeline(categorical_features: list[str], numeric_features: list[
 def _classifier_candidates() -> list[dict]:
     candidates = [
         {"name": "logistic_regression", "estimator": LogisticRegression(max_iter=1500, class_weight="balanced"), "supports_sample_weight": True},
+        {
+            "name": "gradient_boosting_tuned",
+            "estimator": GradientBoostingClassifier(
+                learning_rate=0.05,
+                n_estimators=250,
+                max_depth=3,
+                random_state=42,
+            ),
+            "supports_sample_weight": True,
+        },
         {"name": "random_forest", "estimator": RandomForestClassifier(n_estimators=400, max_depth=10, min_samples_leaf=2, random_state=42, n_jobs=-1), "supports_sample_weight": True},
         {"name": "random_forest_deep", "estimator": RandomForestClassifier(n_estimators=800, max_depth=None, min_samples_leaf=1, class_weight="balanced_subsample", random_state=42, n_jobs=-1), "supports_sample_weight": True},
         {"name": "extra_trees", "estimator": ExtraTreesClassifier(n_estimators=400, max_depth=10, min_samples_leaf=2, random_state=42, n_jobs=-1), "supports_sample_weight": True},
