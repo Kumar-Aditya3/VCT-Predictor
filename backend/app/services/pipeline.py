@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 
 from app.core.config import get_settings
 from app.models.schemas import (
@@ -59,6 +60,57 @@ def _default_upcoming_fixtures(today: date | None = None) -> list[MatchFixture]:
 
 def _clamp_probability(raw_probability: float) -> float:
     return max(0.08, min(0.92, raw_probability))
+
+
+def _normalize_team_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _build_team_alias_index(model_bundle: dict | None) -> dict[str, str]:
+    if model_bundle is None:
+        return {}
+    context = model_bundle.get("context", {})
+    team_names = set(context.get("team_states", {}).keys())
+    for player_state in context.get("player_states", {}).values():
+        team_name = getattr(player_state, "team_name", None)
+        if team_name:
+            team_names.add(team_name)
+
+    alias_index: dict[str, str] = {}
+    collisions: set[str] = set()
+    for team_name in team_names:
+        token = _normalize_team_token(team_name)
+        if not token:
+            continue
+        existing = alias_index.get(token)
+        if existing is None:
+            alias_index[token] = team_name
+            continue
+        if existing != team_name:
+            collisions.add(token)
+
+    for token in collisions:
+        alias_index.pop(token, None)
+
+    return alias_index
+
+
+def _canonicalize_team_name(team_name: str, alias_index: dict[str, str]) -> str:
+    cleaned = team_name.strip()
+    if not cleaned:
+        return team_name
+    token = _normalize_team_token(cleaned)
+    if not token:
+        return cleaned
+    return alias_index.get(token, cleaned)
+
+
+def _canonicalize_fixture_teams(fixture: MatchFixture, alias_index: dict[str, str]) -> MatchFixture:
+    team_a = _canonicalize_team_name(fixture.team_a, alias_index)
+    team_b = _canonicalize_team_name(fixture.team_b, alias_index)
+    if team_a == fixture.team_a and team_b == fixture.team_b:
+        return fixture
+    return fixture.model_copy(update={"team_a": team_a, "team_b": team_b})
 
 
 def _projected_score(probability: float, map_index: int) -> str:
@@ -174,7 +226,8 @@ def _build_match_prediction(fixture: MatchFixture, model_bundle: dict | None) ->
 
 def predict_fixtures(fixtures: list[MatchFixture]) -> PredictionResponse:
     model_bundle = load_model_bundle()
-    predictions = [_build_match_prediction(fixture, model_bundle) for fixture in fixtures]
+    alias_index = _build_team_alias_index(model_bundle)
+    predictions = [_build_match_prediction(_canonicalize_fixture_teams(fixture, alias_index), model_bundle) for fixture in fixtures]
     return PredictionResponse(predictions=predictions)
 
 
