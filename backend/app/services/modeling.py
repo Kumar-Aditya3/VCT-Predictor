@@ -62,6 +62,11 @@ MEDIUM_WINDOW = 5
 MATCH_DECAY_GRID = (0.02, 0.04)
 MAP_DECAY_GRID = (0.01, 0.02)
 PLAYER_DECAY_GRID = (0.01, 0.02)
+WIN_PRIOR_ALPHA = 2.0
+WIN_PRIOR_BETA = 2.0
+MAP_PRIOR_ALPHA = 1.5
+MAP_PRIOR_BETA = 1.5
+MAP_RELIABILITY_TARGET = 6.0
 
 
 @dataclass
@@ -73,6 +78,7 @@ class TeamState:
     recent_results: deque[int] = field(default_factory=lambda: deque(maxlen=RECENT_WINDOW))
     recent_map_margin: deque[int] = field(default_factory=lambda: deque(maxlen=RECENT_WINDOW))
     elo: float = INITIAL_ELO
+    opponent_elo_sum: float = 0.0
     last_played: date | None = None
     map_matches: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     map_wins: dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -396,8 +402,10 @@ def build_match_feature_row(fixture: MatchFixture, context: dict) -> dict:
         "event_stage": fixture.event_stage or "unknown",
         "best_of": fixture.best_of,
         "elo_diff": team_a_state.elo - team_b_state.elo,
-        "matches_played_diff": team_a_state.matches - team_b_state.matches,
+        "experience_index_diff": _experience_index(team_a_state) - _experience_index(team_b_state),
         "win_rate_diff": _win_rate(team_a_state) - _win_rate(team_b_state),
+        "adjusted_win_rate_diff": _adjusted_win_rate(team_a_state) - _adjusted_win_rate(team_b_state),
+        "strength_of_schedule_diff": _strength_of_schedule(team_a_state) - _strength_of_schedule(team_b_state),
         "map_win_rate_diff": _map_win_rate(team_a_state) - _map_win_rate(team_b_state),
         "recent_win_rate_diff": _recent_win_rate(team_a_state) - _recent_win_rate(team_b_state),
         "recent_short_win_rate_diff": _recent_win_rate_window(team_a_state, SHORT_WINDOW) - _recent_win_rate_window(team_b_state, SHORT_WINDOW),
@@ -546,8 +554,8 @@ def _update_match_states(match: VLRMatchRecord, team_states: dict[str, TeamState
     team_a_state.elo += elo_change
     team_b_state.elo -= elo_change
     margin = match.team_a_maps_won - match.team_b_maps_won
-    _apply_match_result(team_a_state, team_a_won, match.team_a_maps_won, match.team_b_maps_won, match.match_date, margin)
-    _apply_match_result(team_b_state, not team_a_won, match.team_b_maps_won, match.team_a_maps_won, match.match_date, -margin)
+    _apply_match_result(team_a_state, team_a_won, match.team_a_maps_won, match.team_b_maps_won, match.match_date, margin, team_b_state.elo)
+    _apply_match_result(team_b_state, not team_a_won, match.team_b_maps_won, match.team_a_maps_won, match.match_date, -margin, team_a_state.elo)
     pair_key = tuple(sorted((match.team_a, match.team_b)))
     if team_a_won:
         head_to_head[pair_key] += 1 if match.team_a <= match.team_b else -1
@@ -1300,24 +1308,47 @@ def _sample_weights(dates: list[date], max_date: date, decay_lambda: float | Non
     return [math.exp(-lambda_value * max((max_date - item).days, 0)) for item in dates]
 
 
-def _apply_match_result(state: TeamState, won: bool, maps_won: int, maps_lost: int, match_date: date, map_margin: int) -> None:
+def _apply_match_result(
+    state: TeamState,
+    won: bool,
+    maps_won: int,
+    maps_lost: int,
+    match_date: date,
+    map_margin: int,
+    opponent_elo: float,
+) -> None:
     state.matches += 1
     if won:
         state.wins += 1
     state.maps_won += maps_won
     state.maps_lost += maps_lost
+    state.opponent_elo_sum += opponent_elo
     state.recent_results.append(1 if won else 0)
     state.recent_map_margin.append(map_margin)
     state.last_played = match_date
 
 
 def _win_rate(state: TeamState) -> float:
-    return state.wins / state.matches if state.matches else 0.5
+    return (state.wins + WIN_PRIOR_ALPHA) / (state.matches + WIN_PRIOR_ALPHA + WIN_PRIOR_BETA)
 
 
 def _map_win_rate(state: TeamState) -> float:
     total = state.maps_won + state.maps_lost
-    return state.maps_won / total if total else 0.5
+    return (state.maps_won + MAP_PRIOR_ALPHA) / (total + MAP_PRIOR_ALPHA + MAP_PRIOR_BETA)
+
+
+def _experience_index(state: TeamState) -> float:
+    return math.log1p(state.matches)
+
+
+def _strength_of_schedule(state: TeamState) -> float:
+    if state.matches <= 0:
+        return 0.0
+    return (state.opponent_elo_sum / state.matches - INITIAL_ELO) / 400.0
+
+
+def _adjusted_win_rate(state: TeamState) -> float:
+    return _win_rate(state) + (0.18 * _strength_of_schedule(state))
 
 
 def _recent_win_rate(state: TeamState) -> float:
@@ -1370,7 +1401,8 @@ def _map_pool_depth(state: TeamState) -> int:
 def _team_map_win_rate(team_name: str, map_name: str, context: dict) -> float:
     state = context["team_states"].get(team_name, TeamState())
     matches = state.map_matches.get(map_name, 0)
-    return state.map_wins.get(map_name, 0) / matches if matches else 0.5
+    wins = state.map_wins.get(map_name, 0)
+    return (wins + MAP_PRIOR_ALPHA) / (matches + MAP_PRIOR_ALPHA + MAP_PRIOR_BETA)
 
 
 def _team_map_round_diff(team_name: str, map_name: str, context: dict) -> float:
@@ -1414,16 +1446,32 @@ def _lineup_stability(team_name: str, context: dict) -> float:
 
 def _rank_maps_for_team(team_name: str, context: dict) -> list[str]:
     state = context["team_states"].get(team_name, TeamState())
-    return sorted(COMMON_MAPS, key=lambda map_name: (_team_map_win_rate(team_name, map_name, context), state.map_matches.get(map_name, 0)), reverse=True)
+    def _map_score(map_name: str) -> tuple[float, int]:
+        matches = state.map_matches.get(map_name, 0)
+        reliability = min(1.0, matches / MAP_RELIABILITY_TARGET)
+        blended = (_team_map_win_rate(team_name, map_name, context) - 0.5) * reliability + 0.5
+        return blended, matches
+
+    return sorted(COMMON_MAPS, key=_map_score, reverse=True)
 
 
 def _combined_map_rank(team_a: str, team_b: str, context: dict) -> list[str]:
+    state_a = context["team_states"].get(team_a, TeamState())
+    state_b = context["team_states"].get(team_b, TeamState())
+
+    def _combined_score(map_name: str) -> tuple[float, int]:
+        a_matches = state_a.map_matches.get(map_name, 0)
+        b_matches = state_b.map_matches.get(map_name, 0)
+        reliability = min(1.0, (a_matches + b_matches) / (2 * MAP_RELIABILITY_TARGET))
+        a_wr = _team_map_win_rate(team_a, map_name, context)
+        b_wr = _team_map_win_rate(team_b, map_name, context)
+        parity = 1.0 - abs(a_wr - b_wr)
+        strength = (a_wr + b_wr) / 2.0
+        return ((0.65 * strength + 0.35 * parity) * reliability, a_matches + b_matches)
+
     return sorted(
         COMMON_MAPS,
-        key=lambda map_name: (
-            _team_map_win_rate(team_a, map_name, context) + _team_map_win_rate(team_b, map_name, context) - abs(_team_map_win_rate(team_a, map_name, context) - _team_map_win_rate(team_b, map_name, context)),
-            context["team_states"].get(team_a, TeamState()).map_matches.get(map_name, 0) + context["team_states"].get(team_b, TeamState()).map_matches.get(map_name, 0),
-        ),
+        key=_combined_score,
         reverse=True,
     )
 
@@ -1455,6 +1503,7 @@ def _clone_team_state(state: TeamState) -> TeamState:
         recent_results=deque(state.recent_results, maxlen=RECENT_WINDOW),
         recent_map_margin=deque(state.recent_map_margin, maxlen=RECENT_WINDOW),
         elo=state.elo,
+        opponent_elo_sum=state.opponent_elo_sum,
         last_played=state.last_played,
     )
     cloned.map_matches = defaultdict(int, dict(state.map_matches))
@@ -1552,6 +1601,7 @@ def _serialize_team_state(state: TeamState) -> dict:
         "recent_results": list(state.recent_results),
         "recent_map_margin": list(state.recent_map_margin),
         "elo": state.elo,
+        "opponent_elo_sum": state.opponent_elo_sum,
         "last_played": state.last_played.isoformat() if state.last_played else None,
         "map_matches": dict(state.map_matches),
         "map_wins": dict(state.map_wins),
@@ -1568,6 +1618,7 @@ def _deserialize_team_state(payload: dict) -> TeamState:
         recent_results=deque(payload.get("recent_results", []), maxlen=RECENT_WINDOW),
         recent_map_margin=deque(payload.get("recent_map_margin", []), maxlen=RECENT_WINDOW),
         elo=payload.get("elo", INITIAL_ELO),
+        opponent_elo_sum=float(payload.get("opponent_elo_sum", 0.0)),
         last_played=date.fromisoformat(payload["last_played"]) if payload.get("last_played") else None,
     )
     state.map_matches = defaultdict(int, payload.get("map_matches", {}))

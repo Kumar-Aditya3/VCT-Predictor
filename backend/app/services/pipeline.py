@@ -62,15 +62,26 @@ def _clamp_probability(raw_probability: float) -> float:
 
 
 def _projected_score(probability: float, map_index: int) -> str:
-    if probability >= 0.66:
-        return "13-7" if map_index % 2 == 0 else "13-8"
-    if probability >= 0.57:
-        return "13-8" if map_index % 2 == 0 else "13-9"
-    if probability >= 0.51:
-        return "13-10" if map_index % 2 == 0 else "13-11"
-    if probability >= 0.49:
-        return "13-11" if map_index % 2 == 0 else "11-13"
-    return "10-13" if map_index % 2 == 0 else "9-13"
+    margin = abs(probability - 0.5) * 2.0
+    loser_rounds = int(round(12 - (margin * 5)))
+    loser_rounds = max(7, min(12, loser_rounds))
+    return f"13-{loser_rounds}" if probability >= 0.5 else f"{loser_rounds}-13"
+
+
+def _projected_maps_played(team_a_match_win_probability: float, best_of: int) -> int:
+    edge = abs(team_a_match_win_probability - 0.5)
+    if best_of <= 1:
+        return 1
+    if best_of == 3:
+        # Strongly favored sides are more likely to close in two maps.
+        return 2 if edge >= 0.14 else 3
+    if best_of == 5:
+        if edge >= 0.18:
+            return 3
+        if edge >= 0.1:
+            return 4
+        return 5
+    return min(best_of, 3)
 
 
 def _current_model_version() -> str:
@@ -106,8 +117,9 @@ def _build_match_prediction(fixture: MatchFixture, model_bundle: dict | None) ->
     if model_bundle is not None:
         team_a_match_win_probability = round(_clamp_probability(predict_match_probability(fixture, model_bundle)), 3)
         selected_maps = select_maps_for_fixture(fixture, model_bundle)
+        projected_maps = _projected_maps_played(team_a_match_win_probability, fixture.best_of)
         map_predictions = []
-        for index, (map_name, picked_by) in enumerate(selected_maps[:3]):
+        for index, (map_name, picked_by) in enumerate(selected_maps[:projected_maps]):
             map_probability = round(_clamp_probability(predict_map_probability(fixture, map_name, picked_by, model_bundle)), 3)
             map_predictions.append(
                 MapPrediction(
@@ -117,7 +129,7 @@ def _build_match_prediction(fixture: MatchFixture, model_bundle: dict | None) ->
                     picked_by=picked_by,
                 )
             )
-        player_projection_rows = predict_player_stat_lines(fixture, selected_maps[:3], model_bundle)
+        player_projection_rows = predict_player_stat_lines(fixture, selected_maps[:projected_maps], model_bundle)
         player_projections = [
             PlayerProjection(
                 player_name=row["player_name"],
