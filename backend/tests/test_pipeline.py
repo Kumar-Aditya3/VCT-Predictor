@@ -35,11 +35,12 @@ class PipelineServiceTests(unittest.TestCase):
         os.environ["ARTIFACTS_DIR"] = self.temp_dir.name
         os.environ["MODEL_ARTIFACTS_DIR"] = str(Path(self.temp_dir.name) / "models")
         os.environ["SQLITE_DB_PATH"] = str(Path(self.temp_dir.name) / "vct.sqlite3")
+        os.environ["FAST_MODEL_SEARCH"] = "1"
         get_settings.cache_clear()
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
-        for key in ("ARTIFACTS_DIR", "MODEL_ARTIFACTS_DIR", "SQLITE_DB_PATH"):
+        for key in ("ARTIFACTS_DIR", "MODEL_ARTIFACTS_DIR", "SQLITE_DB_PATH", "FAST_MODEL_SEARCH"):
             os.environ.pop(key, None)
         get_settings.cache_clear()
 
@@ -168,24 +169,33 @@ class PipelineServiceTests(unittest.TestCase):
             "metrics": {
                 "winner_accuracy": 0.7,
                 "rolling_winner_accuracy": 0.66,
+                "rolling_winner_log_loss": 0.34,
                 "map_accuracy": 0.56,
+                "rolling_map_log_loss": 0.29,
                 "player_kd_mae": 3.1,
+                "rolling_player_kd_mae": 3.1,
             }
         }
         passing_candidate = {
             "metrics": {
                 "winner_accuracy": 0.71,
                 "rolling_winner_accuracy": 0.66,
+                "rolling_winner_log_loss": 0.32,
                 "map_accuracy": 0.56,
+                "rolling_map_log_loss": 0.285,
                 "player_kd_mae": 3.0,
+                "rolling_player_kd_mae": 3.0,
             }
         }
         failing_candidate = {
             "metrics": {
                 "winner_accuracy": 0.66,
                 "rolling_winner_accuracy": 0.66,
+                "rolling_winner_log_loss": 0.36,
                 "map_accuracy": 0.56,
+                "rolling_map_log_loss": 0.30,
                 "player_kd_mae": 3.0,
+                "rolling_player_kd_mae": 3.0,
             }
         }
         self.assertTrue(pipeline_service._should_publish_bundle(passing_candidate, current_bundle))

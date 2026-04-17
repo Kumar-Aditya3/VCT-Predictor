@@ -32,12 +32,13 @@ class ApiRouteTests(unittest.TestCase):
         os.environ["ARTIFACTS_DIR"] = self.temp_dir.name
         os.environ["MODEL_ARTIFACTS_DIR"] = str(Path(self.temp_dir.name) / "models")
         os.environ["SQLITE_DB_PATH"] = str(Path(self.temp_dir.name) / "vct.sqlite3")
+        os.environ["FAST_MODEL_SEARCH"] = "1"
         get_settings.cache_clear()
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
-        for key in ("ARTIFACTS_DIR", "MODEL_ARTIFACTS_DIR", "SQLITE_DB_PATH"):
+        for key in ("ARTIFACTS_DIR", "MODEL_ARTIFACTS_DIR", "SQLITE_DB_PATH", "FAST_MODEL_SEARCH"):
             os.environ.pop(key, None)
         get_settings.cache_clear()
 

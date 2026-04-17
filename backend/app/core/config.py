@@ -50,8 +50,8 @@ class Settings:
         self.model_artifacts_dir: Path = Path(
             os.getenv("MODEL_ARTIFACTS_DIR", str(self.artifacts_dir / "models"))
         ).resolve()
-        self.training_history_days: int = int(os.getenv("TRAINING_HISTORY_DAYS", "180"))
-        self.training_results_pages: int = int(os.getenv("TRAINING_RESULTS_PAGES", "40"))
+        self.training_history_days: int = int(os.getenv("TRAINING_HISTORY_DAYS", "540"))
+        self.training_results_pages: int = int(os.getenv("TRAINING_RESULTS_PAGES", "120"))
         self.upcoming_pages: int = int(os.getenv("UPCOMING_PAGES", "3"))
         self.detail_scrape_limit: int = int(os.getenv("DETAIL_SCRAPE_LIMIT", "600"))
         self.prediction_mode: str = "trained_ml"

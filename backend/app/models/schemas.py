@@ -108,6 +108,11 @@ class ModelPerformanceResponse(BaseModel):
     player_deaths_estimator: Optional[str] = None
     match_calibration: Optional[str] = None
     map_calibration: Optional[str] = None
+    experiment_id: Optional[str] = None
+    dataset_start: Optional[str] = None
+    dataset_end: Optional[str] = None
+    selection_metric: dict[str, str] = Field(default_factory=dict)
+    promoted_model: Optional[bool] = None
     excluded_match_rows: int = Field(default=0, ge=0)
     excluded_map_rows: int = Field(default=0, ge=0)
     excluded_player_rows: int = Field(default=0, ge=0)
@@ -127,6 +132,11 @@ class ValidationReportResponse(BaseModel):
     rolling_windows_evaluated: int = Field(default=0, ge=0)
     integrity_issue_count: int = Field(default=0, ge=0)
     calibration_summary: dict[str, str] = Field(default_factory=dict)
+    experiment_id: Optional[str] = None
+    dataset_start: Optional[str] = None
+    dataset_end: Optional[str] = None
+    selection_metric: dict[str, str] = Field(default_factory=dict)
+    promoted_model: Optional[bool] = None
     rolling_winner_accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
     rolling_map_accuracy: float = Field(default=0.0, ge=0.0, le=1.0)
     rolling_player_kd_mae: float = Field(default=0.0, ge=0.0)

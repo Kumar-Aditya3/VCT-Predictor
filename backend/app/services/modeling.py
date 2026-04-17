@@ -4,8 +4,10 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date
 import math
+import os
 import pickle
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -24,7 +26,7 @@ from sklearn.ensemble import (
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, brier_score_loss, mean_absolute_error
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -51,6 +53,18 @@ except ImportError:  # pragma: no cover - optional dependency
     CatBoostClassifier = None
     CatBoostRegressor = None
 
+try:
+    import optuna
+except ImportError:  # pragma: no cover - optional dependency
+    optuna = None
+
+try:
+    import torch
+    from torch import nn
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+    nn = None
+
 
 MODEL_FILE_NAME = "prediction_bundle.pkl"
 RECENT_WINDOW = 8
@@ -67,6 +81,12 @@ WIN_PRIOR_BETA = 2.0
 MAP_PRIOR_ALPHA = 1.5
 MAP_PRIOR_BETA = 1.5
 MAP_RELIABILITY_TARGET = 6.0
+MATCH_MIN_TRAIN = 20
+MAP_MIN_TRAIN = 40
+PLAYER_MIN_TRAIN = 100
+ROLLING_WINDOWS = 4
+MATCH_OPTUNA_TRIALS = 6
+REGRESSOR_OPTUNA_TRIALS = 6
 
 
 @dataclass
@@ -100,34 +120,54 @@ class PlayerState:
     last_agent: str | None = None
 
 
+@dataclass
+class FoldSummary:
+    index: int
+    train_start: str
+    train_end: str
+    validation_start: str
+    validation_end: str
+    train_size: int
+    validation_size: int
+
+
 def train_prediction_bundle(
     matches: list[VLRMatchRecord],
     maps: list[VLRMapRecord],
     player_stats: list[VLRPlayerStatLine],
 ) -> dict | None:
-    if len(matches) < 20 or len(maps) < 40:
+    completed_matches = [match for match in matches if match.status == "completed"]
+    completed_maps = [map_record for map_record in maps if map_record.winner_team in {map_record.team_a, map_record.team_b}]
+    completed_map_ids = {map_record.map_id for map_record in completed_maps}
+    validated_player_rows = [
+        stat
+        for stat in player_stats
+        if stat.kills >= 0 and stat.deaths >= 0 and stat.map_id in completed_map_ids
+    ]
+    if len(completed_matches) < MATCH_MIN_TRAIN or len(completed_maps) < MAP_MIN_TRAIN:
         return None
 
-    ordered_matches = sorted(matches, key=lambda item: (item.match_date, item.match_id))
+    ordered_matches = sorted(completed_matches, key=lambda item: (item.match_date, item.match_id))
     maps_by_match: dict[str, list[VLRMapRecord]] = defaultdict(list)
     stats_by_map: dict[str, list[VLRPlayerStatLine]] = defaultdict(list)
-    for map_record in maps:
+    for map_record in completed_maps:
         maps_by_match[map_record.match_id].append(map_record)
     for map_list in maps_by_match.values():
         map_list.sort(key=lambda item: item.order_index)
-    for stat in player_stats:
+    for stat in validated_player_rows:
         stats_by_map[stat.map_id].append(stat)
 
     feature_store = _build_feature_store(ordered_matches, maps_by_match, stats_by_map)
-    if len(feature_store["match_rows"]) < 20 or len(feature_store["map_rows"]) < 40:
+    if len(feature_store["match_rows"]) < MATCH_MIN_TRAIN or len(feature_store["map_rows"]) < MAP_MIN_TRAIN:
         return None
+    dataset_snapshot = _dataset_snapshot(ordered_matches, completed_maps, validated_player_rows)
 
     match_bundle = _train_classifier_bundle(
         feature_store["match_rows"],
         feature_store["match_labels"],
         feature_store["match_dates"],
         f"vlr-match-{ordered_matches[-1].match_date.isoformat()}",
-        objective="rolling",
+        task_name="match_winner",
         decay_values=MATCH_DECAY_GRID,
     )
     map_bundle = _train_classifier_bundle(
@@ -135,17 +175,18 @@ def train_prediction_bundle(
         feature_store["map_labels"],
         feature_store["map_dates"],
         f"vlr-map-{ordered_matches[-1].match_date.isoformat()}",
-        objective="rolling",
+        task_name="map_winner",
         decay_values=MAP_DECAY_GRID,
     )
     player_kills_bundle = None
     player_deaths_bundle = None
-    if len(feature_store["player_rows"]) >= 100:
+    if len(feature_store["player_rows"]) >= PLAYER_MIN_TRAIN and not _is_fast_model_search():
         player_kills_bundle = _train_regressor_bundle(
             feature_store["player_rows"],
             feature_store["player_kills"],
             feature_store["player_dates"],
             f"vlr-player-kills-{ordered_matches[-1].match_date.isoformat()}",
+            task_name="player_kills",
             decay_values=PLAYER_DECAY_GRID,
         )
         player_deaths_bundle = _train_regressor_bundle(
@@ -153,6 +194,7 @@ def train_prediction_bundle(
             feature_store["player_deaths"],
             feature_store["player_dates"],
             f"vlr-player-deaths-{ordered_matches[-1].match_date.isoformat()}",
+            task_name="player_deaths",
             decay_values=PLAYER_DECAY_GRID,
         )
     if match_bundle is None or map_bundle is None:
@@ -171,9 +213,29 @@ def train_prediction_bundle(
         "map_model": map_bundle,
         "player_kills_model": player_kills_bundle,
         "player_deaths_model": player_deaths_bundle,
+        "dataset_snapshot": dataset_snapshot,
+        "experiment": {
+            "id": f"experiment-{pd.Timestamp.utcnow().strftime('%Y%m%d-%H%M%S')}",
+            "selection_metric": {
+                "match_winner": "rolling_log_loss",
+                "map_winner": "rolling_log_loss",
+                "player_kills": "rolling_mae",
+                "player_deaths": "rolling_mae",
+            },
+            "task_winners": {
+                "match_winner": match_bundle["estimator_name"],
+                "map_winner": map_bundle["estimator_name"],
+                "player_kills": player_kills_bundle["estimator_name"] if player_kills_bundle is not None else "baseline_fallback",
+                "player_deaths": player_deaths_bundle["estimator_name"] if player_deaths_bundle is not None else "baseline_fallback",
+            },
+        },
         "metrics": {
             "winner_accuracy": match_bundle["accuracy"],
+            "winner_log_loss": match_bundle["log_loss"],
+            "winner_brier": match_bundle["brier"],
             "map_accuracy": map_bundle["accuracy"],
+            "map_log_loss": map_bundle["log_loss"],
+            "map_brier": map_bundle["brier"],
             "player_kd_mae": player_mae,
             "training_samples": len(feature_store["match_rows"]),
             "map_training_samples": len(feature_store["map_rows"]),
@@ -185,7 +247,11 @@ def train_prediction_bundle(
             "map_cv_accuracy": map_bundle["accuracy"],
             "player_cv_score": player_cv_score,
             "rolling_winner_accuracy": match_bundle["rolling_accuracy"],
+            "rolling_winner_log_loss": match_bundle["rolling_log_loss"],
+            "rolling_winner_brier": match_bundle["rolling_brier"],
             "rolling_map_accuracy": map_bundle["rolling_accuracy"],
+            "rolling_map_log_loss": map_bundle["rolling_log_loss"],
+            "rolling_map_brier": map_bundle["rolling_brier"],
             "rolling_player_kd_mae": ((player_kills_bundle["rolling_mae"] + player_deaths_bundle["rolling_mae"]) / 2) if (player_kills_bundle and player_deaths_bundle) else 0.0,
             "match_estimator": match_bundle["estimator_name"],
             "map_estimator": map_bundle["estimator_name"],
@@ -202,10 +268,14 @@ def train_prediction_bundle(
         },
         "backtests": {
             "rolling_winner_accuracy": match_bundle["rolling_accuracy"],
+            "rolling_winner_log_loss": match_bundle["rolling_log_loss"],
+            "rolling_winner_brier": match_bundle["rolling_brier"],
             "rolling_map_accuracy": map_bundle["rolling_accuracy"],
+            "rolling_map_log_loss": map_bundle["rolling_log_loss"],
+            "rolling_map_brier": map_bundle["rolling_brier"],
             "rolling_player_kills_mae": player_kills_bundle["rolling_mae"] if player_kills_bundle is not None else 0.0,
             "rolling_player_deaths_mae": player_deaths_bundle["rolling_mae"] if player_deaths_bundle is not None else 0.0,
-            "rolling_windows_evaluated": 3,
+            "rolling_windows_evaluated": len(match_bundle.get("folds", [])),
         },
         "calibration": {
             "match": match_bundle["calibration_method"],
@@ -214,6 +284,12 @@ def train_prediction_bundle(
         "residuals": {
             "player_kills": player_kills_bundle["residual_quantiles"] if player_kills_bundle is not None else {},
             "player_deaths": player_deaths_bundle["residual_quantiles"] if player_deaths_bundle is not None else {},
+        },
+        "folds": {
+            "match_winner": match_bundle.get("folds", []),
+            "map_winner": map_bundle.get("folds", []),
+            "player_kills": player_kills_bundle.get("folds", []) if player_kills_bundle is not None else [],
+            "player_deaths": player_deaths_bundle.get("folds", []) if player_deaths_bundle is not None else [],
         },
         "context": feature_store["context"],
     }
@@ -395,13 +471,17 @@ def build_match_feature_row(fixture: MatchFixture, context: dict) -> dict:
     team_b_state = team_states.get(fixture.team_b, TeamState())
     player_states = context["player_states"]
     head_to_head = context["head_to_head"]
+    stage_bucket = _normalize_event_stage(fixture.event_stage)
 
     return {
         "region": fixture.region,
         "event_name": fixture.event_name,
         "event_stage": fixture.event_stage or "unknown",
+        "event_stage_bucket": stage_bucket,
+        "is_international_event": 1 if fixture.region == "International" or fixture.event_name in {"Masters", "Champions"} else 0,
         "best_of": fixture.best_of,
         "elo_diff": team_a_state.elo - team_b_state.elo,
+        "event_elo_diff": _event_elo(fixture.team_a, fixture.event_name, context) - _event_elo(fixture.team_b, fixture.event_name, context),
         "experience_index_diff": _experience_index(team_a_state) - _experience_index(team_b_state),
         "win_rate_diff": _win_rate(team_a_state) - _win_rate(team_b_state),
         "adjusted_win_rate_diff": _adjusted_win_rate(team_a_state) - _adjusted_win_rate(team_b_state),
@@ -423,6 +503,7 @@ def build_match_feature_row(fixture: MatchFixture, context: dict) -> dict:
         "player_deaths_diff": _team_player_metric(fixture.team_a, player_states, "deaths") - _team_player_metric(fixture.team_b, player_states, "deaths"),
         "player_acs_diff": _team_player_metric(fixture.team_a, player_states, "acs") - _team_player_metric(fixture.team_b, player_states, "acs"),
         "lineup_stability_diff": _lineup_stability(fixture.team_a, context) - _lineup_stability(fixture.team_b, context),
+        "lineup_continuity_diff": _lineup_continuity(fixture.team_a, context) - _lineup_continuity(fixture.team_b, context),
     }
 
 
@@ -432,14 +513,18 @@ def build_map_feature_row(fixture: MatchFixture, map_name: str, picked_by: str |
     return {
         "region": fixture.region,
         "event_name": fixture.event_name,
+        "event_stage_bucket": _normalize_event_stage(fixture.event_stage),
         "map_name": map_name,
         "picked_by": picked_by or "decider",
         "elo_diff": team_states.get(fixture.team_a, TeamState()).elo - team_states.get(fixture.team_b, TeamState()).elo,
+        "event_elo_diff": _event_elo(fixture.team_a, fixture.event_name, context) - _event_elo(fixture.team_b, fixture.event_name, context),
+        "team_map_event_form_diff": _event_map_strength(fixture.team_a, map_name, fixture.event_name, context) - _event_map_strength(fixture.team_b, map_name, fixture.event_name, context),
         "team_map_win_rate_diff": _team_map_win_rate(fixture.team_a, map_name, context) - _team_map_win_rate(fixture.team_b, map_name, context),
         "team_map_round_diff": _team_map_round_diff(fixture.team_a, map_name, context) - _team_map_round_diff(fixture.team_b, map_name, context),
         "recent_team_form_diff": _recent_win_rate(team_states.get(fixture.team_a, TeamState())) - _recent_win_rate(team_states.get(fixture.team_b, TeamState())),
         "map_head_to_head_delta": _matchup_delta(fixture.team_a, fixture.team_b, head_to_head_by_map.get(map_name, {})),
         "player_map_acs_diff": _team_player_map_metric(fixture.team_a, map_name, context, "acs") - _team_player_map_metric(fixture.team_b, map_name, context, "acs"),
+        "player_map_kills_diff": _team_player_map_metric(fixture.team_a, map_name, context, "kills") - _team_player_map_metric(fixture.team_b, map_name, context, "kills"),
     }
 
 
@@ -453,15 +538,21 @@ def build_player_feature_row(
     context: dict,
 ) -> dict:
     player_state = context["player_states"].get(player_name)
+    team_state = context["team_states"].get(team_name, TeamState())
+    opponent_state = context["team_states"].get(opponent_team, TeamState())
     return {
         "region": fixture.region,
         "event_name": fixture.event_name,
+        "event_stage_bucket": _normalize_event_stage(fixture.event_stage),
         "map_name": map_name,
         "agent_name": agent_name or "unknown",
+        "agent_role": _agent_role(agent_name),
         "team_name": team_name,
         "opponent_team": opponent_team,
-        "team_elo": context["team_states"].get(team_name, TeamState()).elo,
-        "opponent_elo": context["team_states"].get(opponent_team, TeamState()).elo,
+        "team_elo": team_state.elo,
+        "opponent_elo": opponent_state.elo,
+        "event_team_elo": _event_elo(team_name, fixture.event_name, context),
+        "event_opponent_elo": _event_elo(opponent_team, fixture.event_name, context),
         "player_recent_kills": _player_metric(player_state, "kills"),
         "player_recent_deaths": _player_metric(player_state, "deaths"),
         "player_recent_acs": _player_metric(player_state, "acs"),
@@ -469,9 +560,14 @@ def build_player_feature_row(
         "player_map_deaths": _player_metric(player_state, "deaths", map_name=map_name),
         "player_agent_kills": _player_metric(player_state, "kills", agent_name=agent_name),
         "player_agent_deaths": _player_metric(player_state, "deaths", agent_name=agent_name),
+        "player_maps_played": player_state.maps_played if player_state is not None else 0,
+        "player_missing_history": 0 if player_state is not None else 1,
         "team_map_win_rate": _team_map_win_rate(team_name, map_name, context),
         "opponent_map_win_rate": _team_map_win_rate(opponent_team, map_name, context),
         "lineup_stability": _lineup_stability(team_name, context),
+        "lineup_continuity": _lineup_continuity(team_name, context),
+        "team_recent_win_rate": _recent_win_rate(team_state),
+        "opponent_recent_win_rate": _recent_win_rate(opponent_state),
     }
 
 
@@ -485,6 +581,8 @@ def _build_feature_store(
     head_to_head: dict[tuple[str, str], int] = defaultdict(int)
     head_to_head_by_map: dict[str, dict[tuple[str, str], int]] = defaultdict(lambda: defaultdict(int))
     team_recent_players: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    team_event_history: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"matches": 0.0, "wins": 0.0}))
+    team_event_map_history: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: {"matches": 0.0, "wins": 0.0}))
     store = {
         "match_rows": [],
         "match_labels": [],
@@ -515,6 +613,8 @@ def _build_feature_store(
             "head_to_head": head_to_head,
             "head_to_head_by_map": head_to_head_by_map,
             "team_recent_players": team_recent_players,
+            "team_event_history": team_event_history,
+            "team_event_map_history": team_event_map_history,
         }
         store["match_rows"].append(build_match_feature_row(fixture, context))
         store["match_labels"].append(1 if match.team_a_maps_won > match.team_b_maps_won else 0)
@@ -531,9 +631,19 @@ def _build_feature_store(
                 store["player_kills"].append(stat.kills)
                 store["player_deaths"].append(stat.deaths)
                 store["player_dates"].append(match.match_date)
-            _update_map_and_player_states(map_record, stats_by_map.get(map_record.map_id, []), team_states, player_states, head_to_head_by_map, team_recent_players, match.match_date)
+            _update_map_and_player_states(
+                map_record,
+                stats_by_map.get(map_record.map_id, []),
+                team_states,
+                player_states,
+                head_to_head_by_map,
+                team_recent_players,
+                team_event_map_history,
+                match.event_name,
+                match.match_date,
+            )
 
-        _update_match_states(match, team_states, head_to_head)
+        _update_match_states(match, team_states, head_to_head, team_event_history)
 
     store["context"] = {
         "team_states": {name: _clone_team_state(state) for name, state in team_states.items()},
@@ -541,11 +651,18 @@ def _build_feature_store(
         "head_to_head": dict(head_to_head),
         "head_to_head_by_map": {map_name: dict(values) for map_name, values in head_to_head_by_map.items()},
         "team_recent_players": {team: dict(players) for team, players in team_recent_players.items()},
+        "team_event_history": {team: {event: dict(values) for event, values in events.items()} for team, events in team_event_history.items()},
+        "team_event_map_history": {team: {key: dict(values) for key, values in maps.items()} for team, maps in team_event_map_history.items()},
     }
     return store
 
 
-def _update_match_states(match: VLRMatchRecord, team_states: dict[str, TeamState], head_to_head: dict[tuple[str, str], int]) -> None:
+def _update_match_states(
+    match: VLRMatchRecord,
+    team_states: dict[str, TeamState],
+    head_to_head: dict[tuple[str, str], int],
+    team_event_history: dict[str, dict[str, dict[str, float]]],
+) -> None:
     team_a_state = team_states.setdefault(match.team_a, TeamState())
     team_b_state = team_states.setdefault(match.team_b, TeamState())
     team_a_won = match.team_a_maps_won > match.team_b_maps_won
@@ -561,6 +678,12 @@ def _update_match_states(match: VLRMatchRecord, team_states: dict[str, TeamState
         head_to_head[pair_key] += 1 if match.team_a <= match.team_b else -1
     else:
         head_to_head[pair_key] -= 1 if match.team_a <= match.team_b else -1
+    team_event_history[match.team_a][match.event_name]["matches"] += 1.0
+    team_event_history[match.team_b][match.event_name]["matches"] += 1.0
+    if team_a_won:
+        team_event_history[match.team_a][match.event_name]["wins"] += 1.0
+    else:
+        team_event_history[match.team_b][match.event_name]["wins"] += 1.0
 
 
 def _update_map_and_player_states(
@@ -570,6 +693,8 @@ def _update_map_and_player_states(
     player_states: dict[str, PlayerState],
     head_to_head_by_map: dict[str, dict[tuple[str, str], int]],
     team_recent_players: dict[str, dict[str, float]],
+    team_event_map_history: dict[str, dict[str, dict[str, float]]],
+    event_name: str,
     match_date: date,
 ) -> None:
     team_a_state = team_states.setdefault(map_record.team_a, TeamState())
@@ -582,6 +707,13 @@ def _update_map_and_player_states(
         team_a_state.map_wins[map_record.map_name] += 1
     elif map_record.winner_team == map_record.team_b:
         team_b_state.map_wins[map_record.map_name] += 1
+    map_event_key = f"{event_name}:{map_record.map_name}"
+    team_event_map_history[map_record.team_a][map_event_key]["matches"] += 1.0
+    team_event_map_history[map_record.team_b][map_event_key]["matches"] += 1.0
+    if map_record.winner_team == map_record.team_a:
+        team_event_map_history[map_record.team_a][map_event_key]["wins"] += 1.0
+    elif map_record.winner_team == map_record.team_b:
+        team_event_map_history[map_record.team_b][map_event_key]["wins"] += 1.0
 
     pair_key = tuple(sorted((map_record.team_a, map_record.team_b)))
     if map_record.winner_team == map_record.team_a:
@@ -612,28 +744,31 @@ def _train_classifier_bundle(
     dates: list[date],
     version: str,
     *,
-    objective: str = "rolling",
+    task_name: str,
     decay_values: tuple[float, ...] = (0.005, 0.01, 0.02),
 ) -> dict | None:
-    if len(rows) < 20:
+    if len(rows) < MATCH_MIN_TRAIN:
         return None
     frame = pd.DataFrame(rows)
-    split_index = max(10, int(len(frame) * 0.8))
-    if split_index >= len(frame):
-        split_index = len(frame) - 1
+    split_index = max(MATCH_MIN_TRAIN, int(len(frame) * 0.82))
+    split_index = min(split_index, len(frame) - 1)
     train_X = frame.iloc[:split_index]
     val_X = frame.iloc[split_index:]
     train_y = labels[:split_index]
     val_y = labels[split_index:]
-    if not val_y:
+    if not val_y or len(train_y) < MATCH_MIN_TRAIN:
         return None
     categorical_features = [col for col in frame.columns if frame[col].dtype == object]
     numeric_features = [col for col in frame.columns if col not in categorical_features]
     candidates = _classifier_candidates()
+    candidates = _trim_classifier_candidates(candidates, len(frame))
+    decay_values = _trim_decay_values(decay_values, len(frame))
+    candidates.extend(_refine_classifier_candidates(task_name, frame, labels, dates, candidates, categorical_features, numeric_features))
     candidate_results: list[dict] = []
+    fold_descriptors = _rolling_fold_descriptors(dates, windows=ROLLING_WINDOWS, min_train=MATCH_MIN_TRAIN, min_validation=max(4, len(frame) // 12))
     for candidate in candidates:
         for decay_lambda in decay_values:
-            rolling_accuracy = _rolling_classifier_score(
+            evaluation = _rolling_classifier_score(
                 frame,
                 labels,
                 dates,
@@ -642,6 +777,8 @@ def _train_classifier_bundle(
                 numeric_features,
                 decay_lambda,
             )
+            if not evaluation["folds"]:
+                continue
             pipeline = _classifier_pipeline(categorical_features, numeric_features, candidate["estimator"])
             _fit_pipeline(
                 pipeline,
@@ -651,110 +788,88 @@ def _train_classifier_bundle(
                 step_name="classifier",
                 supports_sample_weight=candidate["supports_sample_weight"],
             )
-            holdout_accuracy = accuracy_score(val_y, pipeline.predict(val_X))
             probabilities = pipeline.predict_proba(val_X)[:, 1]
+            holdout_accuracy = accuracy_score(val_y, (probabilities >= 0.5).astype(int))
             candidate_results.append(
                 {
                     "name": candidate["name"],
                     "decay_lambda": decay_lambda,
-                    "rolling_accuracy": float(rolling_accuracy),
+                    "rolling_accuracy": float(evaluation["accuracy"]),
+                    "rolling_log_loss": float(evaluation["log_loss"]),
+                    "rolling_brier": float(evaluation["brier"]),
+                    "rolling_accuracy_std": float(evaluation["accuracy_std"]),
+                    "rolling_log_loss_std": float(evaluation["log_loss_std"]),
+                    "rolling_brier_std": float(evaluation["brier_std"]),
                     "holdout_accuracy": float(holdout_accuracy),
+                    "holdout_log_loss": _safe_log_loss(val_y, probabilities),
                     "brier": float(brier_score_loss(val_y, probabilities)),
+                    "folds": evaluation["folds"],
                 }
             )
 
     if not candidate_results:
         return None
-    if objective == "holdout":
-        candidate_results.sort(key=lambda item: (item["holdout_accuracy"], item["rolling_accuracy"], -item["brier"]), reverse=True)
-    else:
-        candidate_results.sort(key=lambda item: (item["rolling_accuracy"], item["holdout_accuracy"], -item["brier"]), reverse=True)
+    candidate_results.sort(
+        key=lambda item: (
+            item["rolling_log_loss"],
+            item["rolling_brier"],
+            -item["rolling_accuracy"],
+            item["rolling_log_loss_std"],
+            item["holdout_log_loss"],
+        )
+    )
     best_result = candidate_results[0]
     best_candidate = next(candidate for candidate in candidates if candidate["name"] == best_result["name"])
-    ensemble_result = _build_classifier_ensemble_candidate(
-        candidate_results,
-        candidates,
+    selected_result = best_result
+
+    final_pipeline = _classifier_pipeline(categorical_features, numeric_features, best_candidate["estimator"])
+    _fit_pipeline(
+        final_pipeline,
         frame,
         labels,
-        dates,
+        _sample_weights(dates, dates[-1], selected_result["decay_lambda"]),
+        step_name="classifier",
+        supports_sample_weight=best_candidate["supports_sample_weight"],
+    )
+    calibration = _fit_classifier_calibration(
         train_X,
         train_y,
         val_X,
         val_y,
+        dates[:split_index],
+        dates[-1],
+        selected_result["decay_lambda"],
+        best_candidate,
         categorical_features,
         numeric_features,
     )
-    if objective == "holdout":
-        selected_result = ensemble_result if ensemble_result is not None and (
-            ensemble_result["holdout_accuracy"] > best_result["holdout_accuracy"]
-            or (
-                ensemble_result["holdout_accuracy"] == best_result["holdout_accuracy"]
-                and ensemble_result["rolling_accuracy"] > best_result["rolling_accuracy"]
-            )
-        ) else best_result
-    else:
-        selected_result = ensemble_result if ensemble_result is not None and (
-            ensemble_result["rolling_accuracy"] > best_result["rolling_accuracy"]
-            or (
-                ensemble_result["rolling_accuracy"] == best_result["rolling_accuracy"]
-                and ensemble_result["holdout_accuracy"] > best_result["holdout_accuracy"]
-            )
-        ) else best_result
-
-    if selected_result.get("kind") == "ensemble":
-        final_model = _train_classifier_ensemble(
-            selected_result,
-            candidates,
-            frame,
-            labels,
-            dates,
-            categorical_features,
-            numeric_features,
-        )
-    else:
-        final_pipeline = _classifier_pipeline(categorical_features, numeric_features, best_candidate["estimator"])
-        _fit_pipeline(
-            final_pipeline,
-            frame,
-            labels,
-            _sample_weights(dates, dates[-1], selected_result["decay_lambda"]),
-            step_name="classifier",
-            supports_sample_weight=best_candidate["supports_sample_weight"],
-        )
-        calibration = _fit_classifier_calibration(
-            train_X,
-            train_y,
-            val_X,
-            val_y,
-            dates[:split_index],
-            dates[-1],
-            selected_result["decay_lambda"],
-            best_candidate,
-            categorical_features,
-            numeric_features,
-        )
-        final_model = {
-            "kind": "single",
-            "pipeline": final_pipeline,
-            "supports_sample_weight": best_candidate["supports_sample_weight"],
-            "decay_lambda": selected_result["decay_lambda"],
-            "calibration": calibration,
-        }
+    final_model = {
+        "kind": "single",
+        "pipeline": final_pipeline,
+        "supports_sample_weight": best_candidate["supports_sample_weight"],
+        "decay_lambda": selected_result["decay_lambda"],
+        "calibration": calibration,
+    }
 
     return {
         "model": final_model,
         "feature_columns": list(frame.columns),
         "accuracy": float(selected_result["holdout_accuracy"]),
+        "log_loss": float(selected_result["holdout_log_loss"]),
+        "brier": float(selected_result["brier"]),
         "version": version,
         "training_samples": len(frame),
         "validation_samples": len(val_y),
         "rolling_accuracy": float(selected_result["rolling_accuracy"]),
+        "rolling_log_loss": float(selected_result["rolling_log_loss"]),
+        "rolling_brier": float(selected_result["rolling_brier"]),
         "estimator_name": selected_result["name"],
-        "candidate_scores": {f"{item['name']}@{item['decay_lambda']:.3f}": item["holdout_accuracy"] for item in candidate_results},
+        "candidate_scores": {f"{item['name']}@{item['decay_lambda']:.3f}": item["rolling_log_loss"] for item in candidate_results},
         "candidate_results": candidate_results[:12],
         "calibration_method": final_model.get("calibration", {}).get("method", "none"),
         "selected_decay_lambda": selected_result["decay_lambda"],
-        "selection_objective": objective,
+        "selection_objective": "rolling_log_loss",
+        "folds": fold_descriptors,
     }
 
 
@@ -764,14 +879,14 @@ def _train_regressor_bundle(
     dates: list[date],
     version: str,
     *,
+    task_name: str,
     decay_values: tuple[float, ...] = (0.005, 0.01, 0.02),
 ) -> dict | None:
-    if len(rows) < 40:
+    if len(rows) < PLAYER_MIN_TRAIN:
         return None
     frame = pd.DataFrame(rows)
-    split_index = max(20, int(len(frame) * 0.8))
-    if split_index >= len(frame):
-        split_index = len(frame) - 1
+    split_index = max(PLAYER_MIN_TRAIN, int(len(frame) * 0.82))
+    split_index = min(split_index, len(frame) - 1)
     train_X = frame.iloc[:split_index]
     val_X = frame.iloc[split_index:]
     train_y = targets[:split_index]
@@ -781,10 +896,14 @@ def _train_regressor_bundle(
     categorical_features = [col for col in frame.columns if frame[col].dtype == object]
     numeric_features = [col for col in frame.columns if col not in categorical_features]
     candidates = _regressor_candidates()
+    candidates = _trim_regressor_candidates(candidates, len(frame))
+    decay_values = _trim_decay_values(decay_values, len(frame))
+    candidates.extend(_refine_regressor_candidates(task_name, frame, targets, dates, candidates, categorical_features, numeric_features))
     candidate_results: list[dict] = []
+    fold_descriptors = _rolling_fold_descriptors(dates, windows=ROLLING_WINDOWS, min_train=PLAYER_MIN_TRAIN, min_validation=max(12, len(frame) // 14))
     for candidate in candidates:
         for decay_lambda in decay_values:
-            rolling_mae = _rolling_regressor_score(
+            evaluation = _rolling_regressor_score(
                 frame,
                 targets,
                 dates,
@@ -793,6 +912,8 @@ def _train_regressor_bundle(
                 numeric_features,
                 decay_lambda,
             )
+            if not evaluation["folds"]:
+                continue
             pipeline = _regressor_pipeline(categorical_features, numeric_features, candidate["estimator"])
             _fit_pipeline(
                 pipeline,
@@ -802,19 +923,25 @@ def _train_regressor_bundle(
                 step_name="regressor",
                 supports_sample_weight=candidate["supports_sample_weight"],
             )
-            holdout_mae = mean_absolute_error(val_y, pipeline.predict(val_X))
+            predictions = pipeline.predict(val_X)
+            holdout_mae = mean_absolute_error(val_y, predictions)
             candidate_results.append(
                 {
                     "name": candidate["name"],
                     "decay_lambda": decay_lambda,
-                    "rolling_mae": float(rolling_mae),
+                    "rolling_mae": float(evaluation["mae"]),
+                    "rolling_rmse": float(evaluation["rmse"]),
+                    "rolling_mae_std": float(evaluation["mae_std"]),
+                    "rolling_rmse_std": float(evaluation["rmse_std"]),
                     "holdout_mae": float(holdout_mae),
+                    "holdout_rmse": _safe_rmse(val_y, predictions),
+                    "folds": evaluation["folds"],
                 }
             )
 
     if not candidate_results:
         return None
-    candidate_results.sort(key=lambda item: (item["rolling_mae"], item["holdout_mae"]))
+    candidate_results.sort(key=lambda item: (item["rolling_mae"], item["rolling_rmse"], item["rolling_mae_std"], item["holdout_mae"]))
     best_result = candidate_results[0]
     best_candidate = next(candidate for candidate in candidates if candidate["name"] == best_result["name"])
     final_pipeline = _regressor_pipeline(categorical_features, numeric_features, best_candidate["estimator"])
@@ -842,15 +969,19 @@ def _train_regressor_bundle(
         "pipeline": final_pipeline,
         "feature_columns": list(frame.columns),
         "mae": float(best_result["holdout_mae"]),
+        "rmse": float(best_result["holdout_rmse"]),
         "version": version,
         "training_samples": len(frame),
         "validation_samples": len(val_y),
         "rolling_mae": float(best_result["rolling_mae"]),
+        "rolling_rmse": float(best_result["rolling_rmse"]),
         "estimator_name": best_result["name"],
-        "candidate_scores": {f"{item['name']}@{item['decay_lambda']:.3f}": item["holdout_mae"] for item in candidate_results},
+        "candidate_scores": {f"{item['name']}@{item['decay_lambda']:.3f}": item["rolling_mae"] for item in candidate_results},
         "candidate_results": candidate_results[:12],
         "selected_decay_lambda": best_result["decay_lambda"],
         "residual_quantiles": residual_quantiles,
+        "selection_objective": "rolling_mae",
+        "folds": fold_descriptors,
     }
 
 
@@ -872,6 +1003,104 @@ def _regressor_pipeline(categorical_features: list[str], numeric_features: list[
         ]
     )
     return Pipeline([("preprocessor", preprocessor), ("regressor", clone(estimator))])
+
+
+class TorchMLPClassifier:
+    def __init__(self, input_hidden: tuple[int, ...] = (64, 32), epochs: int = 30, learning_rate: float = 0.0025) -> None:
+        self.input_hidden = input_hidden
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.network = None
+
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        return {"input_hidden": self.input_hidden, "epochs": self.epochs, "learning_rate": self.learning_rate}
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+    def fit(self, X, y):
+        if torch is None or nn is None:
+            raise ImportError("torch is required for TorchMLPClassifier")
+        matrix = torch.tensor(np.asarray(X), dtype=torch.float32)
+        target = torch.tensor(np.asarray(y), dtype=torch.float32).view(-1, 1)
+        layers: list[nn.Module] = []
+        input_dim = matrix.shape[1]
+        for hidden in self.input_hidden:
+            layers.extend([nn.Linear(input_dim, hidden), nn.ReLU()])
+            input_dim = hidden
+        layers.append(nn.Linear(input_dim, 1))
+        self.network = nn.Sequential(*layers)
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
+        loss_fn = nn.BCEWithLogitsLoss()
+        self.network.train()
+        for _ in range(self.epochs):
+            optimizer.zero_grad()
+            logits = self.network(matrix)
+            loss = loss_fn(logits, target)
+            loss.backward()
+            optimizer.step()
+        return self
+
+    def predict_proba(self, X):
+        assert self.network is not None
+        matrix = torch.tensor(np.asarray(X), dtype=torch.float32)
+        self.network.eval()
+        with torch.no_grad():
+            logits = self.network(matrix)
+            probs = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+        return np.column_stack([1.0 - probs, probs])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+class TorchMLPRegressor:
+    def __init__(self, input_hidden: tuple[int, ...] = (64, 32), epochs: int = 30, learning_rate: float = 0.0025) -> None:
+        self.input_hidden = input_hidden
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.network = None
+
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        return {"input_hidden": self.input_hidden, "epochs": self.epochs, "learning_rate": self.learning_rate}
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+    def fit(self, X, y):
+        if torch is None or nn is None:
+            raise ImportError("torch is required for TorchMLPRegressor")
+        matrix = torch.tensor(np.asarray(X), dtype=torch.float32)
+        target = torch.tensor(np.asarray(y), dtype=torch.float32).view(-1, 1)
+        layers: list[nn.Module] = []
+        input_dim = matrix.shape[1]
+        for hidden in self.input_hidden:
+            layers.extend([nn.Linear(input_dim, hidden), nn.ReLU()])
+            input_dim = hidden
+        layers.append(nn.Linear(input_dim, 1))
+        self.network = nn.Sequential(*layers)
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
+        loss_fn = nn.MSELoss()
+        self.network.train()
+        for _ in range(self.epochs):
+            optimizer.zero_grad()
+            predictions = self.network(matrix)
+            loss = loss_fn(predictions, target)
+            loss.backward()
+            optimizer.step()
+        return self
+
+    def predict(self, X):
+        assert self.network is not None
+        matrix = torch.tensor(np.asarray(X), dtype=torch.float32)
+        self.network.eval()
+        with torch.no_grad():
+            predictions = self.network(matrix).cpu().numpy().reshape(-1)
+        return predictions
 
 
 def _classifier_candidates() -> list[dict]:
@@ -991,6 +1220,14 @@ def _classifier_candidates() -> list[dict]:
                 "supports_sample_weight": True,
             }
         )
+    if torch is not None:
+        candidates.append(
+            {
+                "name": "torch_mlp",
+                "estimator": TorchMLPClassifier(input_hidden=(64, 32), epochs=30, learning_rate=0.0025),
+                "supports_sample_weight": False,
+            }
+        )
     return candidates
 
 
@@ -1050,6 +1287,14 @@ def _regressor_candidates() -> list[dict]:
                 "supports_sample_weight": True,
             }
         )
+    if torch is not None:
+        candidates.append(
+            {
+                "name": "torch_mlp",
+                "estimator": TorchMLPRegressor(input_hidden=(64, 32), epochs=30, learning_rate=0.0025),
+                "supports_sample_weight": False,
+            }
+        )
     return candidates
 
 
@@ -1068,6 +1313,231 @@ def _fit_pipeline(
     pipeline.fit(X, y)
 
 
+def _trim_classifier_candidates(candidates: list[dict], sample_count: int) -> list[dict]:
+    if _is_fast_model_search():
+        return [candidate for candidate in candidates if candidate["name"] == "logistic_regression"]
+    if sample_count >= 180:
+        return candidates
+    keep_prefixes = ("logistic_regression", "hist_gradient_boosting")
+    return [candidate for candidate in candidates if candidate["name"].startswith(keep_prefixes)]
+
+
+def _trim_regressor_candidates(candidates: list[dict], sample_count: int) -> list[dict]:
+    if _is_fast_model_search():
+        return [candidate for candidate in candidates if candidate["name"] == "hist_gradient_boosting"]
+    if sample_count >= 1200:
+        return candidates
+    keep_prefixes = ("hist_gradient_boosting",)
+    return [candidate for candidate in candidates if candidate["name"].startswith(keep_prefixes)]
+
+
+def _trim_decay_values(decay_values: tuple[float, ...], sample_count: int) -> tuple[float, ...]:
+    if _is_fast_model_search():
+        return decay_values[:1]
+    if sample_count >= 1200:
+        return decay_values
+    return decay_values[:2]
+
+
+def _is_fast_model_search() -> bool:
+    return os.getenv("FAST_MODEL_SEARCH", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_log_loss(y_true, probabilities) -> float:
+    clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1 - 1e-6)
+    return float(log_loss(y_true, clipped, labels=[0, 1]))
+
+
+def _safe_rmse(y_true, predictions) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, predictions)))
+
+
+def _optuna_tune_classifier(
+    task_name: str,
+    frame: pd.DataFrame,
+    labels: list[int],
+    dates: list[date],
+    family_name: str,
+    categorical_features: list[str],
+    numeric_features: list[str],
+) -> dict | None:
+    if optuna is None:
+        return None
+
+    def objective(trial):
+        candidate = _classifier_candidate_from_trial(family_name, trial)
+        if candidate is None:
+            return float("inf")
+        result = _rolling_classifier_score(frame, labels, dates, candidate, categorical_features, numeric_features, trial.suggest_float("decay_lambda", 0.005, 0.04))
+        return result["log_loss"]
+
+    try:
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=MATCH_OPTUNA_TRIALS, show_progress_bar=False)
+    except Exception:
+        return None
+    candidate = _classifier_candidate_from_trial(family_name, study.best_trial)
+    if candidate is None:
+        return None
+    candidate["name"] = f"{task_name}_{family_name}_optuna"
+    return candidate
+
+
+def _optuna_tune_regressor(
+    task_name: str,
+    frame: pd.DataFrame,
+    targets: list[float],
+    dates: list[date],
+    family_name: str,
+    categorical_features: list[str],
+    numeric_features: list[str],
+) -> dict | None:
+    if optuna is None:
+        return None
+
+    def objective(trial):
+        candidate = _regressor_candidate_from_trial(family_name, trial)
+        if candidate is None:
+            return float("inf")
+        result = _rolling_regressor_score(frame, targets, dates, candidate, categorical_features, numeric_features, trial.suggest_float("decay_lambda", 0.005, 0.04))
+        return result["mae"]
+
+    try:
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=REGRESSOR_OPTUNA_TRIALS, show_progress_bar=False)
+    except Exception:
+        return None
+    candidate = _regressor_candidate_from_trial(family_name, study.best_trial)
+    if candidate is None:
+        return None
+    candidate["name"] = f"{task_name}_{family_name}_optuna"
+    return candidate
+
+
+def _classifier_candidate_from_trial(family_name: str, trial) -> dict | None:
+    if family_name == "hist_gradient_boosting":
+        return {
+            "name": family_name,
+            "estimator": HistGradientBoostingClassifier(
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                max_depth=trial.suggest_int("max_depth", 4, 10),
+                max_iter=trial.suggest_int("max_iter", 180, 420),
+                random_state=42,
+            ),
+            "supports_sample_weight": True,
+        }
+    if family_name == "lightgbm" and LGBMClassifier is not None:
+        return {
+            "name": family_name,
+            "estimator": LGBMClassifier(
+                n_estimators=trial.suggest_int("n_estimators", 220, 520),
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                num_leaves=trial.suggest_int("num_leaves", 24, 72),
+                subsample=trial.suggest_float("subsample", 0.75, 1.0),
+                colsample_bytree=trial.suggest_float("colsample_bytree", 0.75, 1.0),
+                random_state=42,
+                verbose=-1,
+            ),
+            "supports_sample_weight": True,
+        }
+    if family_name == "catboost" and CatBoostClassifier is not None:
+        return {
+            "name": family_name,
+            "estimator": CatBoostClassifier(
+                iterations=trial.suggest_int("iterations", 220, 520),
+                depth=trial.suggest_int("depth", 5, 9),
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                loss_function="Logloss",
+                random_seed=42,
+                verbose=False,
+            ),
+            "supports_sample_weight": True,
+        }
+    return None
+
+
+def _regressor_candidate_from_trial(family_name: str, trial) -> dict | None:
+    if family_name == "hist_gradient_boosting":
+        return {
+            "name": family_name,
+            "estimator": HistGradientBoostingRegressor(
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                max_depth=trial.suggest_int("max_depth", 4, 10),
+                max_iter=trial.suggest_int("max_iter", 180, 420),
+                random_state=42,
+            ),
+            "supports_sample_weight": True,
+        }
+    if family_name == "lightgbm" and LGBMRegressor is not None:
+        return {
+            "name": family_name,
+            "estimator": LGBMRegressor(
+                n_estimators=trial.suggest_int("n_estimators", 220, 520),
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                num_leaves=trial.suggest_int("num_leaves", 24, 72),
+                subsample=trial.suggest_float("subsample", 0.75, 1.0),
+                colsample_bytree=trial.suggest_float("colsample_bytree", 0.75, 1.0),
+                random_state=42,
+                verbose=-1,
+            ),
+            "supports_sample_weight": True,
+        }
+    if family_name == "catboost" and CatBoostRegressor is not None:
+        return {
+            "name": family_name,
+            "estimator": CatBoostRegressor(
+                iterations=trial.suggest_int("iterations", 220, 520),
+                depth=trial.suggest_int("depth", 5, 9),
+                learning_rate=trial.suggest_float("learning_rate", 0.02, 0.08),
+                loss_function="RMSE",
+                random_seed=42,
+                verbose=False,
+            ),
+            "supports_sample_weight": True,
+        }
+    return None
+
+
+def _refine_classifier_candidates(
+    task_name: str,
+    frame: pd.DataFrame,
+    labels: list[int],
+    dates: list[date],
+    candidates: list[dict],
+    categorical_features: list[str],
+    numeric_features: list[str],
+) -> list[dict]:
+    if optuna is None or len(frame) < 240:
+        return []
+    family_names = [candidate["name"] for candidate in candidates if candidate["name"] in {"hist_gradient_boosting", "lightgbm", "catboost"}]
+    refined: list[dict] = []
+    for family_name in family_names[:3]:
+        tuned = _optuna_tune_classifier(task_name, frame, labels, dates, family_name, categorical_features, numeric_features)
+        if tuned is not None:
+            refined.append(tuned)
+    return refined
+
+
+def _refine_regressor_candidates(
+    task_name: str,
+    frame: pd.DataFrame,
+    targets: list[float],
+    dates: list[date],
+    candidates: list[dict],
+    categorical_features: list[str],
+    numeric_features: list[str],
+) -> list[dict]:
+    if optuna is None or len(frame) < 2400:
+        return []
+    family_names = [candidate["name"] for candidate in candidates if candidate["name"] in {"hist_gradient_boosting", "lightgbm", "catboost"}]
+    refined: list[dict] = []
+    for family_name in family_names[:3]:
+        tuned = _optuna_tune_regressor(task_name, frame, targets, dates, family_name, categorical_features, numeric_features)
+        if tuned is not None:
+            refined.append(tuned)
+    return refined
+
+
 def _rolling_splits(length: int, *, windows: int, min_train: int, min_validation: int) -> list[tuple[int, int]]:
     if length < (min_train + min_validation):
         return []
@@ -1081,6 +1551,24 @@ def _rolling_splits(length: int, *, windows: int, min_train: int, min_validation
     return splits
 
 
+def _rolling_fold_descriptors(dates: list[date], *, windows: int, min_train: int, min_validation: int) -> list[dict[str, Any]]:
+    descriptors: list[dict[str, Any]] = []
+    effective_windows = 2 if _is_fast_model_search() else min(windows, 3 if len(dates) < 200 else windows)
+    for index, (val_start, val_end) in enumerate(_rolling_splits(len(dates), windows=effective_windows, min_train=min_train, min_validation=min_validation), start=1):
+        descriptors.append(
+            FoldSummary(
+                index=index,
+                train_start=dates[0].isoformat(),
+                train_end=dates[val_start - 1].isoformat(),
+                validation_start=dates[val_start].isoformat(),
+                validation_end=dates[val_end - 1].isoformat(),
+                train_size=val_start,
+                validation_size=val_end - val_start,
+            ).__dict__
+        )
+    return descriptors
+
+
 def _rolling_classifier_score(
     frame: pd.DataFrame,
     labels: list[int],
@@ -1089,9 +1577,18 @@ def _rolling_classifier_score(
     categorical_features: list[str],
     numeric_features: list[str],
     decay_lambda: float,
-) -> float:
-    scores: list[float] = []
-    for val_start, val_end in _rolling_splits(len(frame), windows=3, min_train=20, min_validation=max(6, len(frame) // 10)):
+ ) -> dict[str, Any]:
+    accuracy_scores: list[float] = []
+    log_losses: list[float] = []
+    briers: list[float] = []
+    effective_windows = 2 if _is_fast_model_search() else (3 if len(frame) < 200 else ROLLING_WINDOWS)
+    min_validation = max(4, len(frame) // 12)
+    folds = _rolling_fold_descriptors(dates, windows=effective_windows, min_train=MATCH_MIN_TRAIN, min_validation=min_validation)
+    for fold, (val_start, val_end) in zip(
+        folds,
+        _rolling_splits(len(frame), windows=effective_windows, min_train=MATCH_MIN_TRAIN, min_validation=min_validation),
+        strict=False,
+    ):
         pipeline = _classifier_pipeline(categorical_features, numeric_features, candidate["estimator"])
         _fit_pipeline(
             pipeline,
@@ -1101,9 +1598,22 @@ def _rolling_classifier_score(
             step_name="classifier",
             supports_sample_weight=candidate["supports_sample_weight"],
         )
-        score = accuracy_score(labels[val_start:val_end], pipeline.predict(frame.iloc[val_start:val_end]))
-        scores.append(float(score))
-    return float(sum(scores) / len(scores)) if scores else 0.0
+        probabilities = pipeline.predict_proba(frame.iloc[val_start:val_end])[:, 1]
+        fold["accuracy"] = float(accuracy_score(labels[val_start:val_end], (probabilities >= 0.5).astype(int)))
+        fold["log_loss"] = _safe_log_loss(labels[val_start:val_end], probabilities)
+        fold["brier"] = float(brier_score_loss(labels[val_start:val_end], probabilities))
+        accuracy_scores.append(fold["accuracy"])
+        log_losses.append(fold["log_loss"])
+        briers.append(fold["brier"])
+    return {
+        "accuracy": float(np.mean(accuracy_scores)) if accuracy_scores else 0.0,
+        "log_loss": float(np.mean(log_losses)) if log_losses else float("inf"),
+        "brier": float(np.mean(briers)) if briers else float("inf"),
+        "accuracy_std": float(np.std(accuracy_scores)) if accuracy_scores else 0.0,
+        "log_loss_std": float(np.std(log_losses)) if log_losses else 0.0,
+        "brier_std": float(np.std(briers)) if briers else 0.0,
+        "folds": folds,
+    }
 
 
 def _rolling_regressor_score(
@@ -1114,9 +1624,17 @@ def _rolling_regressor_score(
     categorical_features: list[str],
     numeric_features: list[str],
     decay_lambda: float,
-) -> float:
-    scores: list[float] = []
-    for val_start, val_end in _rolling_splits(len(frame), windows=3, min_train=40, min_validation=max(20, len(frame) // 10)):
+ ) -> dict[str, Any]:
+    maes: list[float] = []
+    rmses: list[float] = []
+    effective_windows = 2 if _is_fast_model_search() else (3 if len(frame) < 1500 else ROLLING_WINDOWS)
+    min_validation = max(12, len(frame) // 14)
+    folds = _rolling_fold_descriptors(dates, windows=effective_windows, min_train=PLAYER_MIN_TRAIN, min_validation=min_validation)
+    for fold, (val_start, val_end) in zip(
+        folds,
+        _rolling_splits(len(frame), windows=effective_windows, min_train=PLAYER_MIN_TRAIN, min_validation=min_validation),
+        strict=False,
+    ):
         pipeline = _regressor_pipeline(categorical_features, numeric_features, candidate["estimator"])
         _fit_pipeline(
             pipeline,
@@ -1126,9 +1644,18 @@ def _rolling_regressor_score(
             step_name="regressor",
             supports_sample_weight=candidate["supports_sample_weight"],
         )
-        score = mean_absolute_error(targets[val_start:val_end], pipeline.predict(frame.iloc[val_start:val_end]))
-        scores.append(float(score))
-    return float(sum(scores) / len(scores)) if scores else float("inf")
+        predictions = pipeline.predict(frame.iloc[val_start:val_end])
+        fold["mae"] = float(mean_absolute_error(targets[val_start:val_end], predictions))
+        fold["rmse"] = _safe_rmse(targets[val_start:val_end], predictions)
+        maes.append(fold["mae"])
+        rmses.append(fold["rmse"])
+    return {
+        "mae": float(np.mean(maes)) if maes else float("inf"),
+        "rmse": float(np.mean(rmses)) if rmses else float("inf"),
+        "mae_std": float(np.std(maes)) if maes else 0.0,
+        "rmse_std": float(np.std(rmses)) if rmses else 0.0,
+        "folds": folds,
+    }
 
 
 def _build_classifier_ensemble_candidate(
@@ -1454,6 +1981,97 @@ def _lineup_stability(team_name: str, context: dict) -> float:
     return sum(sorted(recent.values(), reverse=True)[:5]) / total
 
 
+def _lineup_continuity(team_name: str, context: dict) -> float:
+    recent = context["team_recent_players"].get(team_name, {})
+    if not recent:
+        return 0.0
+    top_values = sorted(recent.values(), reverse=True)[:5]
+    if not top_values:
+        return 0.0
+    return sum(value * value for value in top_values) / max(sum(top_values) ** 2, 1.0)
+
+
+def _normalize_event_stage(stage: str | None) -> str:
+    normalized = (stage or "unknown").strip().lower()
+    if "grand" in normalized or "final" in normalized:
+        return "final"
+    if "lower" in normalized:
+        return "lower_bracket"
+    if "upper" in normalized:
+        return "upper_bracket"
+    if "playoff" in normalized or "quarter" in normalized or "semi" in normalized:
+        return "playoffs"
+    if "group" in normalized or "week" in normalized:
+        return "group_stage"
+    return "other"
+
+
+def _agent_role(agent_name: str | None) -> str:
+    if not agent_name:
+        return "unknown"
+    role_map = {
+        "Jett": "duelist",
+        "Raze": "duelist",
+        "Phoenix": "duelist",
+        "Yoru": "duelist",
+        "Sova": "initiator",
+        "Fade": "initiator",
+        "Skye": "initiator",
+        "Breach": "initiator",
+        "Omen": "controller",
+        "Viper": "controller",
+        "Brimstone": "controller",
+        "Astra": "controller",
+        "Killjoy": "sentinel",
+        "Cypher": "sentinel",
+        "Sage": "sentinel",
+        "Chamber": "sentinel",
+    }
+    return role_map.get(agent_name, "flex")
+
+
+def _event_elo(team_name: str, event_name: str, context: dict) -> float:
+    event_history = context.get("team_event_history", {}).get(team_name, {}).get(event_name, {})
+    matches = float(event_history.get("matches", 0.0))
+    wins = float(event_history.get("wins", 0.0))
+    event_win_rate = (wins + WIN_PRIOR_ALPHA) / (matches + WIN_PRIOR_ALPHA + WIN_PRIOR_BETA)
+    base_elo = context.get("team_states", {}).get(team_name, TeamState()).elo
+    return base_elo + ((event_win_rate - 0.5) * 120.0)
+
+
+def _event_map_strength(team_name: str, map_name: str, event_name: str, context: dict) -> float:
+    event_map_key = f"{event_name}:{map_name}"
+    history = context.get("team_event_map_history", {}).get(team_name, {}).get(event_map_key, {})
+    matches = float(history.get("matches", 0.0))
+    wins = float(history.get("wins", 0.0))
+    if matches <= 0:
+        return _team_map_win_rate(team_name, map_name, context)
+    return (wins + MAP_PRIOR_ALPHA) / (matches + MAP_PRIOR_ALPHA + MAP_PRIOR_BETA)
+
+
+def _dataset_snapshot(
+    matches: list[VLRMatchRecord],
+    maps: list[VLRMapRecord],
+    player_stats: list[VLRPlayerStatLine],
+) -> dict[str, Any]:
+    per_region: dict[str, int] = defaultdict(int)
+    per_event: dict[str, int] = defaultdict(int)
+    for match in matches:
+        per_region[match.region] += 1
+        per_event[match.event_name] += 1
+    return {
+        "matches": len(matches),
+        "maps": len(maps),
+        "player_rows": len(player_stats),
+        "date_range": {
+            "start": matches[0].match_date.isoformat() if matches else None,
+            "end": matches[-1].match_date.isoformat() if matches else None,
+        },
+        "per_region": dict(sorted(per_region.items())),
+        "per_event": dict(sorted(per_event.items())),
+    }
+
+
 def _rank_maps_for_team(team_name: str, context: dict) -> list[str]:
     state = context["team_states"].get(team_name, TeamState())
     def _map_score(map_name: str) -> tuple[float, int]:
@@ -1584,6 +2202,14 @@ def _serialize_context(context: dict) -> dict:
             map_name: list(values.items()) for map_name, values in context["head_to_head_by_map"].items()
         },
         "team_recent_players": {team: dict(players) for team, players in context["team_recent_players"].items()},
+        "team_event_history": {
+            team: {event: dict(values) for event, values in events.items()}
+            for team, events in context.get("team_event_history", {}).items()
+        },
+        "team_event_map_history": {
+            team: {key: dict(values) for key, values in maps.items()}
+            for team, maps in context.get("team_event_map_history", {}).items()
+        },
     }
 
 
@@ -1598,6 +2224,14 @@ def _deserialize_context(context: dict) -> dict:
         },
         "team_recent_players": {
             team: dict(players) for team, players in context.get("team_recent_players", {}).items()
+        },
+        "team_event_history": {
+            team: {event: dict(values) for event, values in events.items()}
+            for team, events in context.get("team_event_history", {}).items()
+        },
+        "team_event_map_history": {
+            team: {key: dict(values) for key, values in maps.items()}
+            for team, maps in context.get("team_event_map_history", {}).items()
         },
     }
 

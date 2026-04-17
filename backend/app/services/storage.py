@@ -183,9 +183,8 @@ class SQLiteStore:
             return
         with self.connect() as connection:
             for details in details_list:
-                if details.player_stats:
-                    connection.execute("DELETE FROM player_map_stats WHERE match_id = ?", (details.match.match_id,))
-                    connection.execute("DELETE FROM maps WHERE match_id = ?", (details.match.match_id,))
+                connection.execute("DELETE FROM player_map_stats WHERE match_id = ?", (details.match.match_id,))
+                connection.execute("DELETE FROM maps WHERE match_id = ?", (details.match.match_id,))
                 connection.execute(
                     """
                     INSERT INTO matches (

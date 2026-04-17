@@ -18,6 +18,7 @@ venv/
 
 # Data and model artifacts
 artifacts/
+reports/
 catboost_info/
 backend/catboost_info/
 data/metadata/

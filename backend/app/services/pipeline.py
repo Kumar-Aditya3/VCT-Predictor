@@ -50,6 +50,14 @@ def _run_artifact_path(run_at: datetime) -> Path:
     return _artifacts_dir() / f"pipeline_run_{run_at.strftime('%Y%m%d_%H%M%S')}.json"
 
 
+def _json_default(value):
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def _default_upcoming_fixtures(today: date | None = None) -> list[MatchFixture]:
     fixture_date = today or date.today()
     return [
@@ -161,6 +169,25 @@ def _prediction_metadata(model_bundle: dict | None, team_a_match_win_probability
         "confidence_score": confidence_score,
         "prediction_generated_at": model_bundle.get("trained_at"),
         "sample_size": int(metrics.get("training_samples", 0) or 0),
+    }
+
+
+def _experiment_metadata(model_bundle: dict | None) -> dict[str, object | None]:
+    if model_bundle is None:
+        return {
+            "experiment_id": None,
+            "dataset_start": None,
+            "dataset_end": None,
+            "selection_metric": {},
+        }
+    snapshot = model_bundle.get("dataset_snapshot", {})
+    date_range = snapshot.get("date_range", {})
+    experiment = model_bundle.get("experiment", {})
+    return {
+        "experiment_id": experiment.get("id"),
+        "dataset_start": date_range.get("start"),
+        "dataset_end": date_range.get("end"),
+        "selection_metric": experiment.get("selection_metric", {}),
     }
 
 
@@ -278,23 +305,39 @@ def run_weekly_update() -> WeeklyRunSummary:
     player_stats = store.load_player_stats()
     previous_bundle = load_model_bundle()
     model_bundle = train_prediction_bundle(matches, maps, player_stats)
-    publish_note = "trained_new_bundle"
-    if previous_bundle is not None and model_bundle is not None and not _should_publish_bundle(model_bundle, previous_bundle):
-        publish_note = "trained_new_bundle_below_guardrail"
-    model_path = save_model_bundle(model_bundle) if model_bundle is not None else None
+    publish_note = "training_failed"
+    promoted_model = False
+    live_bundle = previous_bundle
+    model_path = None
+    if model_bundle is not None:
+        publish_note = "trained_candidate_retained_previous"
+        if _should_publish_bundle(model_bundle, previous_bundle):
+            model_path = save_model_bundle(model_bundle)
+            publish_note = "trained_new_bundle_promoted"
+            promoted_model = True
+            live_bundle = model_bundle
+        else:
+            publish_note = "trained_candidate_retained_previous"
 
     try:
         upcoming_fixtures = filter_tier1_fixtures(client.fetch_upcoming_fixtures(from_date=now.date(), to_date=now.date() + timedelta(days=7)))
     except Exception:
         upcoming_fixtures = []
     prediction_fixtures = upcoming_fixtures or _default_upcoming_fixtures(now.date())
-    prediction_response = predict_fixtures(prediction_fixtures)
-    model_version = prediction_response.predictions[0].model_version if prediction_response.predictions else _current_model_version()
+    prediction_response = PredictionResponse(
+        predictions=[
+            _build_match_prediction(_canonicalize_fixture_teams(fixture, _build_team_alias_index(live_bundle)), live_bundle)
+            for fixture in prediction_fixtures
+        ]
+    )
+    model_version = prediction_response.predictions[0].model_version if prediction_response.predictions else (live_bundle["model_version"] if live_bundle is not None else _current_model_version())
     prediction_mode = _current_prediction_mode()
     validation = validation_report_from_bundle(model_bundle, now.isoformat(), "weekly_pipeline")
     validation = validation.model_copy(
         update={
             "integrity_issue_count": len(integrity_result["scrape_issues"]),
+            "promoted_model": promoted_model,
+            **_experiment_metadata(model_bundle),
         }
     )
 
@@ -319,6 +362,7 @@ def run_weekly_update() -> WeeklyRunSummary:
     artifact_path = _run_artifact_path(now)
     summary.artifact_path = str(artifact_path)
     counts = store.counts()
+    dataset_snapshot = model_bundle.get("dataset_snapshot", {}) if model_bundle is not None else {}
     feature_summary = {
         "excluded_match_rows": integrity_result["exclusion_counts"]["excluded_matches"],
         "excluded_map_rows": integrity_result["exclusion_counts"]["excluded_maps"],
@@ -337,17 +381,23 @@ def run_weekly_update() -> WeeklyRunSummary:
                     "history_start": history_start.isoformat(),
                     "history_end": now.date().isoformat(),
                     "model_artifact_path": str(model_path) if model_path is not None else None,
+                    **_experiment_metadata(model_bundle),
+                    "promoted_model": promoted_model,
                 },
                 "search": model_bundle.get("search", {}) if model_bundle is not None else {},
                 "backtests": model_bundle.get("backtests", {}) if model_bundle is not None else {},
                 "calibration": model_bundle.get("calibration", {}) if model_bundle is not None else {},
                 "candidate_results": model_bundle.get("search", {}) if model_bundle is not None else {},
                 "residuals": model_bundle.get("residuals", {}) if model_bundle is not None else {},
+                "dataset_snapshot": dataset_snapshot,
+                "experiment": model_bundle.get("experiment", {}) if model_bundle is not None else {},
+                "folds": model_bundle.get("folds", {}) if model_bundle is not None else {},
                 "exclusions": feature_summary,
-                "publish": {"decision": publish_note},
+                "publish": {"decision": publish_note, "promoted_model": promoted_model},
                 "storage": counts,
             },
             indent=2,
+            default=_json_default,
         ),
         encoding="utf-8",
     )
@@ -364,25 +414,56 @@ def run_weekly_update() -> WeeklyRunSummary:
 
 
 def _should_publish_bundle(candidate_bundle: dict, current_bundle: dict) -> bool:
-    candidate_match = float(candidate_bundle.get("metrics", {}).get("winner_accuracy", 0.0))
-    current_match = float(current_bundle.get("metrics", {}).get("winner_accuracy", 0.0))
-    candidate_rolling = float(candidate_bundle.get("metrics", {}).get("rolling_winner_accuracy", 0.0))
-    current_rolling = float(current_bundle.get("metrics", {}).get("rolling_winner_accuracy", 0.0))
-    candidate_map = float(candidate_bundle.get("metrics", {}).get("map_accuracy", 0.0))
-    candidate_player_mae = float(candidate_bundle.get("metrics", {}).get("player_kd_mae", float("inf")))
-    if candidate_match < 0.67:
+    if candidate_bundle is None:
         return False
-    if candidate_rolling < 0.65:
-        return False
-    if candidate_map < 0.54:
-        return False
-    if candidate_player_mae > 3.2:
-        return False
-    if candidate_match > current_match:
+    if current_bundle is None:
         return True
-    if candidate_match == current_match and candidate_rolling >= current_rolling:
-        return True
-    return False
+    candidate_metrics = candidate_bundle.get("metrics", {})
+    current_metrics = current_bundle.get("metrics", {})
+    candidate_match_log_loss = _metric_with_fallback(
+        candidate_metrics,
+        "rolling_winner_log_loss",
+        fallback_key="rolling_winner_accuracy",
+        fallback_transform=lambda value: 1.0 - float(value),
+    )
+    current_match_log_loss = _metric_with_fallback(
+        current_metrics,
+        "rolling_winner_log_loss",
+        fallback_key="rolling_winner_accuracy",
+        fallback_transform=lambda value: 1.0 - float(value),
+    )
+    candidate_map_log_loss = _metric_with_fallback(
+        candidate_metrics,
+        "rolling_map_log_loss",
+        fallback_key="map_accuracy",
+        fallback_transform=lambda value: 1.0 - float(value),
+    )
+    current_map_log_loss = _metric_with_fallback(
+        current_metrics,
+        "rolling_map_log_loss",
+        fallback_key="map_accuracy",
+        fallback_transform=lambda value: 1.0 - float(value),
+    )
+    candidate_player_mae = float(candidate_metrics.get("rolling_player_kd_mae", float("inf")))
+    current_player_mae = float(current_metrics.get("rolling_player_kd_mae", float("inf")))
+    candidate_accuracy = float(candidate_metrics.get("rolling_winner_accuracy", 0.0))
+    current_accuracy = float(current_metrics.get("rolling_winner_accuracy", 0.0))
+    if candidate_accuracy < 0.52:
+        return False
+    improves_match = candidate_match_log_loss <= current_match_log_loss - 0.005
+    improves_map = candidate_map_log_loss <= current_map_log_loss - 0.003
+    stable_player = candidate_player_mae <= current_player_mae + 0.1
+    return improves_match and improves_map and stable_player
+
+
+def _metric_with_fallback(metrics: dict, primary_key: str, *, fallback_key: str, fallback_transform) -> float:
+    primary_value = metrics.get(primary_key)
+    if primary_value is not None:
+        return float(primary_value)
+    fallback_value = metrics.get(fallback_key)
+    if fallback_value is None:
+        return float("inf")
+    return float(fallback_transform(fallback_value))
 
 
 def get_model_performance() -> ModelPerformanceResponse:
@@ -407,6 +488,7 @@ def get_model_performance() -> ModelPerformanceResponse:
             rolling_winner_accuracy=0.0,
             rolling_map_accuracy=0.0,
             rolling_player_kd_mae=0.0,
+            selection_metric={},
             excluded_match_rows=0,
             excluded_map_rows=0,
             excluded_player_rows=0,
@@ -420,6 +502,10 @@ def get_model_performance() -> ModelPerformanceResponse:
     storage = payload.get("storage", {})
     exclusions = payload.get("exclusions", {})
     search = payload.get("search", {})
+    experiment = payload.get("experiment", {})
+    dataset_snapshot = payload.get("dataset_snapshot", {})
+    publish = payload.get("publish", {})
+    date_range = dataset_snapshot.get("date_range", {})
     return ModelPerformanceResponse(
         last_run_at=summary["run_at"],
         prediction_mode=summary["prediction_mode"],
@@ -445,6 +531,11 @@ def get_model_performance() -> ModelPerformanceResponse:
         player_deaths_estimator=training.get("player_deaths_estimator"),
         match_calibration=training.get("match_calibration"),
         map_calibration=training.get("map_calibration"),
+        experiment_id=experiment.get("id") or training.get("experiment_id"),
+        dataset_start=training.get("dataset_start") or date_range.get("start"),
+        dataset_end=training.get("dataset_end") or date_range.get("end"),
+        selection_metric=training.get("selection_metric", {}) or experiment.get("selection_metric", {}),
+        promoted_model=publish.get("promoted_model"),
         excluded_match_rows=exclusions.get("excluded_match_rows", 0),
         excluded_map_rows=exclusions.get("excluded_map_rows", 0),
         excluded_player_rows=exclusions.get("excluded_player_rows", 0),
@@ -515,6 +606,11 @@ def _normalize_validation_payload(payload: dict) -> dict:
         "rolling_windows_evaluated": int(payload.get("rolling_windows_evaluated", 0)),
         "integrity_issue_count": int(payload.get("integrity_issue_count", 0)),
         "calibration_summary": payload.get("calibration_summary", {}),
+        "experiment_id": payload.get("experiment_id"),
+        "dataset_start": payload.get("dataset_start"),
+        "dataset_end": payload.get("dataset_end"),
+        "selection_metric": payload.get("selection_metric", {}),
+        "promoted_model": payload.get("promoted_model"),
         "rolling_winner_accuracy": float(payload.get("rolling_winner_accuracy", 0.0)),
         "rolling_map_accuracy": float(payload.get("rolling_map_accuracy", 0.0)),
         "rolling_player_kd_mae": float(payload.get("rolling_player_kd_mae", 0.0)),

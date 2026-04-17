@@ -5,7 +5,10 @@ import { getUpcomingPredictions } from "@/lib/api";
 
 export default async function HomePage() {
   const snapshot = await getUpcomingPredictions();
-  const sourceLabel = snapshot.source === "frontend_fallback" ? "Fallback Bootstrap Data" : "API Snapshot";
+  const sourceLabel =
+    snapshot.source === "frontend_fallback" || snapshot.source === "bootstrap_fallback"
+      ? "Fallback Bootstrap Data"
+      : "API Snapshot";
 
   return (
     <main className="grid-ambient min-h-screen">
