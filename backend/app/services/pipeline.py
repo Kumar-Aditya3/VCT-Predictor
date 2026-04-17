@@ -258,10 +258,67 @@ def predict_fixtures(fixtures: list[MatchFixture]) -> PredictionResponse:
     return PredictionResponse(predictions=predictions)
 
 
+def _fixtures_from_snapshot(snapshot: PredictionSnapshot) -> list[MatchFixture]:
+    fixtures: list[MatchFixture] = []
+    for prediction in snapshot.predictions:
+        if prediction.match_date is None or prediction.region is None or prediction.event_name is None:
+            continue
+        projected_maps = max(1, len(prediction.map_predictions))
+        fixtures.append(
+            MatchFixture(
+                match_id=prediction.match_id,
+                region=prediction.region,
+                event_name=prediction.event_name,
+                event_stage=prediction.event_stage,
+                team_a=prediction.team_a,
+                team_b=prediction.team_b,
+                match_date=prediction.match_date,
+                best_of=min(5, max(3, projected_maps)),
+            )
+        )
+    return fixtures
+
+
+def _snapshot_from_fixtures(fixtures: list[MatchFixture], source: str) -> PredictionSnapshot:
+    predictions = predict_fixtures(fixtures).predictions
+    model_version = predictions[0].model_version if predictions else _current_model_version()
+    return PredictionSnapshot(
+        generated_at=_utc_now().isoformat(),
+        source=source,
+        prediction_mode=_current_prediction_mode(),
+        model_version=model_version,
+        predictions=predictions,
+    )
+
+
+def _store_latest_snapshot(snapshot: PredictionSnapshot) -> None:
+    latest_path = _latest_artifact_path()
+    if latest_path is None:
+        return
+    try:
+        payload = json.loads(latest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    payload["snapshot"] = snapshot.model_dump(mode="json")
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["model_version"] = snapshot.model_version
+        summary["prediction_mode"] = snapshot.prediction_mode
+    latest_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+
+
 def get_upcoming_predictions() -> PredictionSnapshot:
     today = date.today()
     latest = load_latest_snapshot()
     if latest is not None:
+        live_model_version = _current_model_version()
+        if latest.model_version == live_model_version:
+            return latest
+        refreshed_fixtures = _fixtures_from_snapshot(latest)
+        if refreshed_fixtures:
+            refreshed_snapshot = _snapshot_from_fixtures(refreshed_fixtures, "artifact_refresh")
+            _store_latest_snapshot(refreshed_snapshot)
+            return refreshed_snapshot
         return latest
 
     client = VLRClient()
@@ -274,15 +331,7 @@ def get_upcoming_predictions() -> PredictionSnapshot:
     else:
         fixtures = _default_upcoming_fixtures(today)
         source = "bootstrap_fallback"
-    predictions = predict_fixtures(fixtures).predictions
-    model_version = predictions[0].model_version if predictions else _current_model_version()
-    return PredictionSnapshot(
-        generated_at=_utc_now().isoformat(),
-        source=source,
-        prediction_mode=_current_prediction_mode(),
-        model_version=model_version,
-        predictions=predictions,
-    )
+    return _snapshot_from_fixtures(fixtures, source)
 
 
 def run_weekly_update() -> WeeklyRunSummary:

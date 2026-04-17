@@ -10,7 +10,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.core.config import get_settings
-from app.models.schemas import MatchFixture, MatchPrediction
+from app.models.schemas import MatchFixture, MatchPrediction, PredictionSnapshot
 from app.models.vlr import VLRMatchDetails, VLRMatchRecord
 from app.services.modeling import load_model_bundle, predict_match_probability, train_prediction_bundle
 from app.services import pipeline as pipeline_service
@@ -200,6 +200,54 @@ class PipelineServiceTests(unittest.TestCase):
         }
         self.assertTrue(pipeline_service._should_publish_bundle(passing_candidate, current_bundle))
         self.assertFalse(pipeline_service._should_publish_bundle(failing_candidate, current_bundle))
+
+    def test_get_upcoming_predictions_refreshes_stale_snapshot_model_version(self) -> None:
+        stale_snapshot = PredictionSnapshot(
+            generated_at="2026-04-17T04:00:00+00:00",
+            source="weekly_pipeline",
+            prediction_mode="trained_ml",
+            model_version="vlr-core-old",
+            predictions=[
+                MatchPrediction(
+                    match_id="fixture-1",
+                    team_a="Alpha 1",
+                    team_b="Beta 1",
+                    region="Pacific",
+                    event_name="Masters",
+                    event_stage="Group Stage",
+                    match_date="2026-04-18",
+                    team_a_match_win_probability=0.51,
+                    map_predictions=[],
+                    player_projections=[],
+                    model_version="vlr-core-old",
+                )
+            ],
+        )
+        refreshed_prediction = MatchPrediction(
+            match_id="fixture-1",
+            team_a="Alpha 1",
+            team_b="Beta 1",
+            region="Pacific",
+            event_name="Masters",
+            event_stage="Group Stage",
+            match_date="2026-04-18",
+            team_a_match_win_probability=0.64,
+            map_predictions=[],
+            player_projections=[],
+            model_version="vlr-core-new",
+        )
+
+        with (
+            patch("app.services.pipeline.load_latest_snapshot", return_value=stale_snapshot),
+            patch("app.services.pipeline._current_model_version", return_value="vlr-core-new"),
+            patch("app.services.pipeline._current_prediction_mode", return_value="trained_ml"),
+            patch("app.services.pipeline.predict_fixtures", return_value=pipeline_service.PredictionResponse(predictions=[refreshed_prediction])),
+        ):
+            snapshot = pipeline_service.get_upcoming_predictions()
+
+        self.assertEqual(snapshot.model_version, "vlr-core-new")
+        self.assertEqual(snapshot.source, "artifact_refresh")
+        self.assertEqual(snapshot.predictions[0].team_a_match_win_probability, 0.64)
 
 
 if __name__ == "__main__":
