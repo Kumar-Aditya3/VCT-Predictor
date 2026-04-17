@@ -420,50 +420,31 @@ def _should_publish_bundle(candidate_bundle: dict, current_bundle: dict) -> bool
         return True
     candidate_metrics = candidate_bundle.get("metrics", {})
     current_metrics = current_bundle.get("metrics", {})
-    candidate_match_log_loss = _metric_with_fallback(
-        candidate_metrics,
-        "rolling_winner_log_loss",
-        fallback_key="rolling_winner_accuracy",
-        fallback_transform=lambda value: 1.0 - float(value),
-    )
-    current_match_log_loss = _metric_with_fallback(
-        current_metrics,
-        "rolling_winner_log_loss",
-        fallback_key="rolling_winner_accuracy",
-        fallback_transform=lambda value: 1.0 - float(value),
-    )
-    candidate_map_log_loss = _metric_with_fallback(
-        candidate_metrics,
-        "rolling_map_log_loss",
-        fallback_key="map_accuracy",
-        fallback_transform=lambda value: 1.0 - float(value),
-    )
-    current_map_log_loss = _metric_with_fallback(
-        current_metrics,
-        "rolling_map_log_loss",
-        fallback_key="map_accuracy",
-        fallback_transform=lambda value: 1.0 - float(value),
-    )
+    candidate_match_log_loss = candidate_metrics.get("rolling_winner_log_loss")
+    current_match_log_loss = current_metrics.get("rolling_winner_log_loss")
+    candidate_map_log_loss = candidate_metrics.get("rolling_map_log_loss")
+    current_map_log_loss = current_metrics.get("rolling_map_log_loss")
     candidate_player_mae = float(candidate_metrics.get("rolling_player_kd_mae", float("inf")))
     current_player_mae = float(current_metrics.get("rolling_player_kd_mae", float("inf")))
     candidate_accuracy = float(candidate_metrics.get("rolling_winner_accuracy", 0.0))
     current_accuracy = float(current_metrics.get("rolling_winner_accuracy", 0.0))
+    candidate_map_accuracy = float(candidate_metrics.get("rolling_map_accuracy", candidate_metrics.get("map_accuracy", 0.0)))
+    current_map_accuracy = float(current_metrics.get("rolling_map_accuracy", current_metrics.get("map_accuracy", 0.0)))
     if candidate_accuracy < 0.52:
         return False
-    improves_match = candidate_match_log_loss <= current_match_log_loss - 0.005
-    improves_map = candidate_map_log_loss <= current_map_log_loss - 0.003
+
+    if candidate_match_log_loss is not None and current_match_log_loss is not None:
+        improves_match = float(candidate_match_log_loss) <= float(current_match_log_loss) - 0.005
+    else:
+        improves_match = candidate_accuracy >= current_accuracy + 0.02
+
+    if candidate_map_log_loss is not None and current_map_log_loss is not None:
+        improves_map = float(candidate_map_log_loss) <= float(current_map_log_loss) - 0.003
+    else:
+        improves_map = candidate_map_accuracy >= current_map_accuracy + 0.01
+
     stable_player = candidate_player_mae <= current_player_mae + 0.1
     return improves_match and improves_map and stable_player
-
-
-def _metric_with_fallback(metrics: dict, primary_key: str, *, fallback_key: str, fallback_transform) -> float:
-    primary_value = metrics.get(primary_key)
-    if primary_value is not None:
-        return float(primary_value)
-    fallback_value = metrics.get(fallback_key)
-    if fallback_value is None:
-        return float("inf")
-    return float(fallback_transform(fallback_value))
 
 
 def get_model_performance() -> ModelPerformanceResponse:
