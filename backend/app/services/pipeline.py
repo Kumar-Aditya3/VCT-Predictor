@@ -259,20 +259,21 @@ def predict_fixtures(fixtures: list[MatchFixture]) -> PredictionResponse:
 
 
 def get_upcoming_predictions() -> PredictionSnapshot:
-    client = VLRClient()
     today = date.today()
+    latest = load_latest_snapshot()
+    if latest is not None:
+        return latest
+
+    client = VLRClient()
     try:
         fixtures = filter_tier1_fixtures(client.fetch_upcoming_fixtures(from_date=today, to_date=today + timedelta(days=7)))
     except Exception:
         fixtures = []
-    if not fixtures:
-        latest = load_latest_snapshot()
-        if latest is not None:
-            return latest
+    if fixtures:
+        source = "vlr_schedule"
+    else:
         fixtures = _default_upcoming_fixtures(today)
         source = "bootstrap_fallback"
-    else:
-        source = "vlr_schedule"
     predictions = predict_fixtures(fixtures).predictions
     model_version = predictions[0].model_version if predictions else _current_model_version()
     return PredictionSnapshot(
