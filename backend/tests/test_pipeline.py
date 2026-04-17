@@ -1,4 +1,5 @@
 import os
+from collections import deque
 from pathlib import Path
 import sys
 import tempfile
@@ -12,7 +13,15 @@ if str(BACKEND_DIR) not in sys.path:
 from app.core.config import get_settings
 from app.models.schemas import MatchFixture, MatchPrediction, PredictionSnapshot
 from app.models.vlr import VLRMatchDetails, VLRMatchRecord
-from app.services.modeling import load_model_bundle, predict_match_probability, train_prediction_bundle
+from app.services.modeling import (
+    PlayerState,
+    TeamState,
+    _likely_lineup,
+    _plasticity_adjustment,
+    load_model_bundle,
+    predict_match_probability,
+    train_prediction_bundle,
+)
 from app.services import pipeline as pipeline_service
 from app.services.pipeline import get_model_performance, get_validation_report, predict_fixtures, run_weekly_update
 from app.services.storage import SQLiteStore
@@ -248,6 +257,99 @@ class PipelineServiceTests(unittest.TestCase):
         self.assertEqual(snapshot.model_version, "vlr-core-new")
         self.assertEqual(snapshot.source, "artifact_refresh")
         self.assertEqual(snapshot.predictions[0].team_a_match_win_probability, 0.64)
+
+    def test_likely_lineup_excludes_players_on_other_current_team(self) -> None:
+        context = {
+            "team_recent_players": {
+                "Paper Rex": {
+                    "PatMen": 10.0,
+                    "Jinggg": 9.0,
+                    "d4v41": 8.0,
+                    "something": 7.0,
+                    "mindfreak": 6.0,
+                    "f0rsakeN": 5.0,
+                }
+            },
+            "player_states": {
+                "PatMen": PlayerState(team_name="Global Esports"),
+                "Jinggg": PlayerState(team_name="Paper Rex"),
+                "d4v41": PlayerState(team_name="Paper Rex"),
+                "something": PlayerState(team_name="Paper Rex"),
+                "mindfreak": PlayerState(team_name="Paper Rex"),
+                "f0rsakeN": PlayerState(team_name="Paper Rex"),
+            },
+        }
+
+        lineup = _likely_lineup("Paper Rex", context)
+        self.assertNotIn("PatMen", lineup)
+        self.assertEqual(len(lineup), 5)
+
+    def test_plasticity_adjustment_rewards_recent_improving_team(self) -> None:
+        team_a_state = TeamState(matches=40, wins=18)
+        team_a_state.recent_results = deque([1, 1, 1, 1, 1], maxlen=8)
+        team_a_state.recent_map_margin = deque([6, 5, 4], maxlen=8)
+
+        team_b_state = TeamState(matches=40, wins=24)
+        team_b_state.recent_results = deque([0, 0, 1, 0, 0], maxlen=8)
+        team_b_state.recent_map_margin = deque([-4, -5, -3], maxlen=8)
+
+        context = {
+            "team_states": {
+                "Team A": team_a_state,
+                "Team B": team_b_state,
+            },
+            "team_recent_players": {
+                "Team A": {"A1": 5.0, "A2": 5.0, "A3": 5.0, "A4": 5.0, "A5": 5.0},
+                "Team B": {"B1": 5.0, "B2": 5.0, "B3": 5.0, "B4": 5.0, "B5": 5.0},
+            },
+        }
+        fixture = MatchFixture(
+            match_id="plasticity-1",
+            region="Pacific",
+            event_name="Masters",
+            event_stage="Playoffs",
+            team_a="Team A",
+            team_b="Team B",
+            match_date="2026-04-17",
+            best_of=3,
+        )
+
+        adjustment = _plasticity_adjustment(fixture, context, base_probability=0.46)
+        self.assertGreater(adjustment, 0.0)
+
+    def test_plasticity_adjustment_is_damped_for_large_base_edge(self) -> None:
+        team_a_state = TeamState(matches=36, wins=15)
+        team_a_state.recent_results = deque([1, 1, 1, 1, 1], maxlen=8)
+        team_a_state.recent_map_margin = deque([5, 4, 6], maxlen=8)
+
+        team_b_state = TeamState(matches=36, wins=23)
+        team_b_state.recent_results = deque([0, 0, 1, 0, 0], maxlen=8)
+        team_b_state.recent_map_margin = deque([-5, -4, -3], maxlen=8)
+
+        context = {
+            "team_states": {
+                "Team A": team_a_state,
+                "Team B": team_b_state,
+            },
+            "team_recent_players": {
+                "Team A": {"A1": 6.0, "A2": 6.0, "A3": 6.0, "A4": 6.0, "A5": 6.0},
+                "Team B": {"B1": 6.0, "B2": 6.0, "B3": 6.0, "B4": 6.0, "B5": 6.0},
+            },
+        }
+        fixture = MatchFixture(
+            match_id="plasticity-2",
+            region="Pacific",
+            event_name="Masters",
+            event_stage="Playoffs",
+            team_a="Team A",
+            team_b="Team B",
+            match_date="2026-04-17",
+            best_of=3,
+        )
+
+        close_edge = abs(_plasticity_adjustment(fixture, context, base_probability=0.52))
+        heavy_edge = abs(_plasticity_adjustment(fixture, context, base_probability=0.84))
+        self.assertLess(heavy_edge, close_edge)
 
 
 if __name__ == "__main__":

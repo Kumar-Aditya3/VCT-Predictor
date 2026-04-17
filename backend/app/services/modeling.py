@@ -87,6 +87,10 @@ PLAYER_MIN_TRAIN = 100
 ROLLING_WINDOWS = 4
 MATCH_OPTUNA_TRIALS = 6
 REGRESSOR_OPTUNA_TRIALS = 6
+PLASTICITY_BASE_WEIGHT = 0.08
+PLASTICITY_RELIABILITY_WEIGHT = 0.18
+PLASTICITY_MAX_SHIFT = 0.16
+PLASTICITY_EDGE_DAMPING = 1.6
 
 
 @dataclass
@@ -321,20 +325,22 @@ def train_match_winner_model(matches: list[VLRMatchRecord]) -> dict | None:
 
 
 def predict_match_probability(fixture: MatchFixture, model_bundle: dict) -> float:
-    forward_row = build_match_feature_row(fixture, model_bundle["context"])
+    context = model_bundle["context"]
+    forward_row = build_match_feature_row(fixture, context)
     forward_frame = pd.DataFrame([forward_row], columns=model_bundle["match_model"]["feature_columns"])
     forward_probability = _predict_classifier_probability(model_bundle["match_model"], forward_frame)
 
     reverse_fixture = _swap_fixture_teams(fixture)
-    reverse_row = build_match_feature_row(reverse_fixture, model_bundle["context"])
+    reverse_row = build_match_feature_row(reverse_fixture, context)
     reverse_frame = pd.DataFrame([reverse_row], columns=model_bundle["match_model"]["feature_columns"])
     reverse_probability = _predict_classifier_probability(model_bundle["match_model"], reverse_frame)
 
     # Make inference invariant to Team A / Team B ordering.
     invariant_probability = (forward_probability + (1.0 - reverse_probability)) / 2.0
-    prior_delta = _context_matchup_prior(fixture, model_bundle["context"])
+    prior_delta = _context_matchup_prior(fixture, context)
     blended_probability = invariant_probability + (0.2 * prior_delta)
-    return float(np.clip(blended_probability, 1e-6, 1 - 1e-6))
+    plasticity_delta = _plasticity_adjustment(fixture, context, blended_probability)
+    return float(np.clip(blended_probability + plasticity_delta, 1e-6, 1 - 1e-6))
 
 
 def _context_matchup_prior(fixture: MatchFixture, context: dict) -> float:
@@ -353,6 +359,36 @@ def _context_matchup_prior(fixture: MatchFixture, context: dict) -> float:
         + 0.15 * (_lineup_stability(fixture.team_a, context) - _lineup_stability(fixture.team_b, context))
     )
     return float(np.clip(signal, -0.2, 0.2))
+
+
+def _team_form_trend(state: TeamState) -> float:
+    short_wr = _recent_win_rate_window(state, SHORT_WINDOW)
+    medium_wr = _recent_win_rate_window(state, MEDIUM_WINDOW)
+    long_wr = _adjusted_win_rate(state)
+    margin_trend = math.tanh(_recent_map_margin_window(state, SHORT_WINDOW) / 8.0)
+    trend = (0.6 * (short_wr - long_wr)) + (0.4 * (medium_wr - long_wr)) + (0.15 * margin_trend)
+    return float(np.clip(trend, -0.8, 0.8))
+
+
+def _team_recent_reliability(team_name: str, state: TeamState, context: dict) -> float:
+    recency_samples = min(1.0, len(state.recent_results) / MEDIUM_WINDOW)
+    lineup_reliability = max(0.0, min(1.0, _lineup_stability(team_name, context)))
+    return recency_samples * (0.5 + (0.5 * lineup_reliability))
+
+
+def _plasticity_adjustment(fixture: MatchFixture, context: dict, base_probability: float) -> float:
+    team_states = context["team_states"]
+    team_a_state = team_states.get(fixture.team_a, TeamState())
+    team_b_state = team_states.get(fixture.team_b, TeamState())
+
+    trend_delta = _team_form_trend(team_a_state) - _team_form_trend(team_b_state)
+    reliability = min(
+        _team_recent_reliability(fixture.team_a, team_a_state, context),
+        _team_recent_reliability(fixture.team_b, team_b_state, context),
+    )
+    edge_damp = max(0.35, 1.0 - (PLASTICITY_EDGE_DAMPING * abs(base_probability - 0.5)))
+    weight = PLASTICITY_BASE_WEIGHT + (PLASTICITY_RELIABILITY_WEIGHT * reliability)
+    return float(np.clip(trend_delta * weight * edge_damp, -PLASTICITY_MAX_SHIFT, PLASTICITY_MAX_SHIFT))
 
 
 def predict_map_probability(fixture: MatchFixture, map_name: str, picked_by: str | None, model_bundle: dict) -> float:
@@ -2108,7 +2144,18 @@ def _likely_lineup(team_name: str, context: dict) -> list[str]:
     recent = context["team_recent_players"].get(team_name, {})
     if not recent:
         return [f"{team_name} Player {index}" for index in range(1, 6)]
-    return [player for player, _ in sorted(recent.items(), key=lambda item: item[1], reverse=True)[:5]]
+
+    player_states = context.get("player_states", {})
+    lineup: list[str] = []
+    for player_name, _ in sorted(recent.items(), key=lambda item: item[1], reverse=True):
+        player_state = player_states.get(player_name)
+        if player_state is not None and player_state.team_name != team_name:
+            continue
+        lineup.append(player_name)
+        if len(lineup) >= 5:
+            break
+
+    return lineup if lineup else [player for player, _ in sorted(recent.items(), key=lambda item: item[1], reverse=True)[:5]]
 
 
 def _preferred_agent(player_name: str, context: dict) -> str | None:
