@@ -81,36 +81,6 @@ Backend tests:
 python -m unittest discover -s backend/tests
 ```
 
-## GitHub Publish Checklist
-
-Before your first push:
-
-1. Initialize git in the project root:
-
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-```
-
-2. Confirm generated files are excluded by `.gitignore`:
-- `artifacts/`
-- `data/raw/`
-- `data/processed/`
-- `catboost_info/`
-- `.venv/`
-- `frontend/node_modules/` and `frontend/.next/`
-
-3. Keep local configuration in `.env` and only commit `.env.example`.
-
-4. Add your remote and push:
-
-```bash
-git branch -M main
-git remote add origin <your-repo-url>
-git push -u origin main
-```
-
 ## Project Layout
 
 ```text
